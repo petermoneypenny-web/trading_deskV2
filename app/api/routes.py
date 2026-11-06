@@ -12,6 +12,7 @@ from app.services.alerts import send_ntfy_alert
 from app.services.stream import fetch_single_ticker_data
 from app.services.gemini_agent import evaluate_intraday_opportunity
 from app.services.risk_engine import open_position, close_position, liquidate_all_positions
+from app.services.scheduler import scheduler
 
 router = APIRouter()
 
@@ -57,6 +58,19 @@ async def get_system_status():
     }
 
 
+@router.get("/scheduler/jobs")
+async def get_scheduled_jobs():
+    jobs = []
+    for job in scheduler.get_jobs():
+        jobs.append({
+            "id": job.id,
+            "name": job.name,
+            "next_run_time": job.next_run_time.isoformat() if job.next_run_time else None,
+            "trigger": str(job.trigger)
+        })
+    return {"scheduler_running": scheduler.running, "jobs": jobs}
+
+
 @router.get("/watchlist")
 async def get_watchlist():
     return {
@@ -74,7 +88,7 @@ async def add_watchlist_ticker(payload: TickerRequest):
     if ticker not in system_state.active_tickers:
         system_state.active_tickers.append(ticker)
 
-    # Immediately fetch initial candle buffer asynchronously so signals are ready right away
+    # Immediately fetch initial candle buffer asynchronously
     asyncio.create_task(fetch_single_ticker_data(ticker))
 
     return {"status": "added", "ticker": ticker, "tickers": system_state.active_tickers}
@@ -195,7 +209,6 @@ async def evaluate_ticker_now(ticker: str):
     ticker_upper = ticker.upper()
     analysis = system_state.technical_analysis.get(ticker_upper)
     
-    # If buffer not yet ready, attempt on-demand fetch first
     if not analysis:
         await fetch_single_ticker_data(ticker_upper)
         analysis = system_state.technical_analysis.get(ticker_upper)
