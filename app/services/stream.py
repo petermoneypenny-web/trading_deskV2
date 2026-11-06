@@ -2,6 +2,7 @@ import asyncio
 import logging
 from datetime import datetime
 from zoneinfo import ZoneInfo
+from typing import Dict
 import yfinance as yf
 import pandas as pd
 
@@ -43,22 +44,85 @@ def get_current_session_phase() -> str:
         return "CLOSED"
 
 
-def _fetch_ticker_intraday(ticker: str) -> pd.DataFrame:
-    """Pulls intraday bars with 5d fallback for off-hours testing."""
-    t = yf.Ticker(ticker)
-    df = t.history(period="1d", interval="1m", prepost=True)
+def _fetch_batched_intraday(tickers: list[str]) -> Dict[str, pd.DataFrame]:
+    """
+    Downloads 1-minute bars for all watchlist tickers in a single HTTP request.
+    Handles MultiIndex columns returned for multiple tickers and regular columns for single tickers.
+    Falls back to period='5d' if current session has no bars (e.g. market closed or weekend).
+    """
+    if not tickers:
+        return {}
+
+    ticker_str = " ".join(tickers)
+    
+    # Try fetching current day 1m bars with extended hours
+    df = yf.download(
+        tickers=ticker_str,
+        period="1d",
+        interval="1m",
+        prepost=True,
+        progress=False,
+        group_by="column"
+    )
+
+    # Off-market / pre-session fallback: pull 5d to ensure populated buffer
     if df is None or df.empty:
-        df = t.history(period="5d", interval="1m", prepost=True)
+        logger.info(f"Batched 1d download empty for [{ticker_str}]. Falling back to 5d history.")
+        df = yf.download(
+            tickers=ticker_str,
+            period="5d",
+            interval="1m",
+            prepost=True,
+            progress=False,
+            group_by="column"
+        )
         if df is not None and not df.empty:
             df = df.tail(120)
-    return df
+
+    if df is None or df.empty:
+        return {}
+
+    result: Dict[str, pd.DataFrame] = {}
+
+    # Case A: Multiple tickers returned -> columns are MultiIndex (Metric, Ticker)
+    if isinstance(df.columns, pd.MultiIndex):
+        for ticker in tickers:
+            try:
+                sub_df = pd.DataFrame(index=df.index)
+                for metric in ["Open", "High", "Low", "Close", "Volume"]:
+                    if (metric, ticker) in df.columns:
+                        sub_df[metric] = df[(metric, ticker)]
+                
+                # Drop rows where price is NaN
+                sub_df.dropna(subset=["Close"], inplace=True)
+                if not sub_df.empty:
+                    result[ticker] = sub_df
+            except Exception as e:
+                logger.warning(f"Error extracting sub-dataframe for {ticker}: {e}")
+
+    # Case B: Single ticker returned -> standard flat columns
+    else:
+        ticker = tickers[0]
+        sub_df = df.copy()
+        sub_df.dropna(subset=["Close"], inplace=True)
+        if not sub_df.empty:
+            result[ticker] = sub_df
+
+    return result
 
 
 async def sync_market_data():
-    """Fetches intraday bars, updates buffers, evaluates setups, and manages execution."""
-    for ticker in system_state.active_tickers:
-        try:
-            df = await asyncio.to_thread(_fetch_ticker_intraday, ticker)
+    """Fetches intraday bars in a single batched call, updates buffers, evaluates setups, and manages execution."""
+    active_tickers = list(system_state.active_tickers)
+    if not active_tickers:
+        return
+
+    try:
+        # Offload synchronous batched download to dedicated worker thread
+        data_map = await asyncio.to_thread(_fetch_batched_intraday, active_tickers)
+
+        for ticker in active_tickers:
+            df = data_map.get(ticker)
             if df is not None and not df.empty:
                 buffer_manager.load_initial_history(ticker, df, interval="1m")
                 last_bar = buffer_manager.get_latest_bar(ticker, interval="1m")
@@ -71,10 +135,12 @@ async def sync_market_data():
                         "timestamp": last_bar["timestamp"]
                     }
 
+                # Calculate indicators on the refreshed rolling buffer
                 buffer_df = buffer_manager.get_dataframe(ticker, interval="1m")
                 analysis = evaluate_intraday_technical_snapshot(buffer_df)
                 system_state.technical_analysis[ticker] = analysis
 
+                # Evaluate Gemini and execute during active trading phases
                 if system_state.is_active and system_state.session_phase in ("RTH_OPEN", "RTH_NORMAL"):
                     if analysis.get("signal") not in ("NEUTRAL", None):
                         decision = await evaluate_intraday_opportunity(
@@ -99,14 +165,17 @@ async def sync_market_data():
                                 reasoning=decision["reasoning"]
                             )
 
-            system_state.last_fetch_error = None
-        except Exception as e:
-            error_msg = f"Failed to ingest/evaluate {ticker}: {e}"
-            logger.warning(error_msg)
-            system_state.last_fetch_error = error_msg
+        system_state.last_fetch_error = None
 
+    except Exception as e:
+        error_msg = f"Failed in batched market data sync: {e}"
+        logger.warning(error_msg)
+        system_state.last_fetch_error = error_msg
+
+    # Update stop losses and unrealized PnL on every cycle
     await update_open_positions_and_risk(system_state.latest_quotes)
 
+    # Mandatory EOD Liquidation: Flatten all positions 15 minutes before market close
     if system_state.session_phase == "RTH_EOD_CLOSING" and system_state.open_positions:
         logger.info("RTH_EOD_CLOSING reached. Flattening all intraday positions.")
         await liquidate_all_positions(reason="RTH_EOD_AUTO_CLOSE")
@@ -116,6 +185,8 @@ async def run_intraday_tick_loop():
     """Background asynchronous loop for market monitoring and buffer updates."""
     logger.info("Day-Trading Intraday Loop initialized.")
     init_db()
+    
+    # Warm up buffer once on startup
     await sync_market_data()
 
     while True:
