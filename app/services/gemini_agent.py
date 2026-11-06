@@ -132,7 +132,8 @@ Determine action (BUY, SELL, or HOLD), dynamic stop loss, and target profit. Out
         async with httpx.AsyncClient(timeout=10.0) as client:
             response = await client.post(url, json=payload)
             if response.status_code != 200:
-                logger.error(f"Gemini API returned status {response.status_code}: {response.text}")
+                err_text = response.text
+                logger.error(f"Gemini API returned status {response.status_code}: {err_text}")
                 return {
                     "action": "HOLD",
                     "confidence": 0,
@@ -140,7 +141,7 @@ Determine action (BUY, SELL, or HOLD), dynamic stop loss, and target profit. Out
                     "stop_loss": 0.0,
                     "take_profit": 0.0,
                     "risk_reward_ratio": 0.0,
-                    "reasoning": f"Gemini API error (HTTP {response.status_code})"
+                    "reasoning": f"Gemini API error ({response.status_code}): {err_text[:120]}"
                 }
 
             result_data = response.json()
