@@ -38,6 +38,27 @@ def init_db():
         """)
         conn.commit()
 
+def load_open_positions_on_startup():
+    """Restores unclosed trades from SQLite on container startup."""
+    db_path = settings.DATABASE_URL.replace("sqlite:///", "")
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM trades WHERE exit_time IS NULL")
+        rows = cursor.fetchall()
+        for r in rows:
+            system_state.open_positions[r["ticker"]] = {
+                "ticker": r["ticker"],
+                "action": r["action"],
+                "shares": r["shares"],
+                "entry_price": r["entry_price"],
+                "current_price": r["entry_price"],
+                "stop_loss": r["stop_loss"],
+                "take_profit": r["take_profit"],
+                "entry_time": r["entry_time"],
+                "unrealized_pnl": 0.0,
+                "reasoning": "Restored on boot"
+            }
 
 def calculate_position_size(entry_price: float, stop_loss: float, risk_budget: float = MAX_RISK_PER_TRADE) -> int:
     """Calculates number of shares based on fixed dollar risk and stop loss distance."""
