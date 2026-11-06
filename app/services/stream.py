@@ -16,25 +16,19 @@ logger = logging.getLogger("trading_desk_v2.stream")
 def get_current_session_phase() -> str:
     """Calculates US market session phase based on Eastern Time."""
     now_et = datetime.now(ZoneInfo("America/New_York"))
-    # Check weekday (Monday=0 ... Sunday=6)
     if now_et.weekday() >= 5:
         return "CLOSED_WEEKEND"
 
     time_mins = now_et.hour * 60 + now_et.minute
 
-    # Pre-market: 04:00 - 09:30 ET
     if 4 * 60 <= time_mins < 9 * 60 + 30:
         return "PRE_MARKET"
-    # RTH Open surge: 09:30 - 10:00 ET (high volatility)
     elif 9 * 60 + 30 <= time_mins < 10 * 60:
         return "RTH_OPEN"
-    # Regular trading hours: 10:00 - 15:45 ET
     elif 10 * 60 <= time_mins < 15 * 60 + 45:
         return "RTH_NORMAL"
-    # End-of-Day liquidation window: 15:45 - 16:00 ET
     elif 15 * 60 + 45 <= time_mins < 16 * 60:
         return "RTH_EOD_CLOSING"
-    # After hours: 16:00 - 20:00 ET
     elif 16 * 60 <= time_mins < 20 * 60:
         return "POST_MARKET"
     else:
@@ -43,11 +37,22 @@ def get_current_session_phase() -> str:
 
 def _fetch_ticker_intraday(ticker: str) -> pd.DataFrame:
     """
-    Synchronous yfinance fetcher designed to be executed inside asyncio.to_thread.
-    Pulls 1-day 1-minute historical bars.
+    Pulls intraday bars. Falls back to period='5d' if the market is closed
+    so buffers are never empty during testing or weekend preparation.
     """
     t = yf.Ticker(ticker)
-    df = t.history(period="1d", interval="1m")
+    
+    # Try fetching current day including extended hours
+    df = t.history(period="1d", interval="1m", prepost=True)
+    
+    # If market is closed or no bars today, pull recent days and slice the latest session
+    if df is None or df.empty:
+        logger.info(f"No 1d intraday bars for {ticker}. Fetching recent multi-day history.")
+        df = t.history(period="5d", interval="1m", prepost=True)
+        if df is not None and not df.empty:
+            # Retain the most recent session's bars up to the buffer limit
+            df = df.tail(120)
+
     return df
 
 
@@ -69,7 +74,7 @@ async def send_ntfy_alert(title: str, message: str, priority: int = 3):
 
 
 async def sync_market_data():
-    """Fetches intraday bars for all active tickers without blocking the main event loop."""
+    """Fetches intraday bars for all active tickers without blocking the event loop."""
     for ticker in system_state.active_tickers:
         try:
             df = await asyncio.to_thread(_fetch_ticker_intraday, ticker)
@@ -94,6 +99,10 @@ async def sync_market_data():
 async def run_intraday_tick_loop():
     """Background asynchronous loop for market monitoring and buffer updates."""
     logger.info("Day-Trading Intraday Loop initialized.")
+    
+    # Warm up buffer once on startup regardless of session status
+    await sync_market_data()
+
     while True:
         try:
             system_state.session_phase = get_current_session_phase()
@@ -103,7 +112,6 @@ async def run_intraday_tick_loop():
                 await sync_market_data()
                 logger.debug(f"Market tick synced at {system_state.last_loop_timestamp.isoformat()}")
 
-            # Sleep interval: 10s during active trading, 60s when market closed or paused
             sleep_duration = 10 if system_state.is_active else 60
             await asyncio.sleep(sleep_duration)
         except asyncio.CancelledError:
