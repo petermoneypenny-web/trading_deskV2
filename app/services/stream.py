@@ -7,10 +7,15 @@ import yfinance as yf
 import pandas as pd
 import os
 
-# Configure custom cache directory to silence Docker container cache warning
-os.makedirs("/tmp/py-yfinance", exist_ok=True)
+# Disable yfinance internal SQLite disk-cache locking inside container
+import yfinance.cache as yf_cache
 try:
+    # Point tz cache to a volatile RAM/temp path
+    os.makedirs("/tmp/py-yfinance", exist_ok=True)
     yf.set_tz_cache_location("/tmp/py-yfinance")
+    # Disable persistent SQLite ticker/cookie caching
+    if hasattr(yf_cache, "enable_cache"):
+        yf_cache.enable_cache(False)
 except Exception:
     pass
 
@@ -55,21 +60,20 @@ def get_current_session_phase() -> str:
 def _fetch_batched_intraday(tickers: list[str]) -> Dict[str, pd.DataFrame]:
     """
     Downloads 1-minute bars for all watchlist tickers in a single HTTP request.
-    Handles MultiIndex columns returned for multiple tickers and regular columns for single tickers.
-    Falls back to period='5d' if current session has no bars (e.g. market closed or weekend).
     """
     if not tickers:
         return {}
 
     ticker_str = " ".join(tickers)
     
-    # Try fetching current day 1m bars with extended hours
+    # Try fetching current day 1m bars with extended hours, disabling multi-threading lock
     df = yf.download(
         tickers=ticker_str,
         period="1d",
         interval="1m",
         prepost=True,
         progress=False,
+        threads=False,
         group_by="column"
     )
 
@@ -82,6 +86,7 @@ def _fetch_batched_intraday(tickers: list[str]) -> Dict[str, pd.DataFrame]:
             interval="1m",
             prepost=True,
             progress=False,
+            threads=False,
             group_by="column"
         )
         if df is not None and not df.empty:
@@ -92,7 +97,6 @@ def _fetch_batched_intraday(tickers: list[str]) -> Dict[str, pd.DataFrame]:
 
     result: Dict[str, pd.DataFrame] = {}
 
-    # Case A: Multiple tickers returned -> columns are MultiIndex (Metric, Ticker)
     if isinstance(df.columns, pd.MultiIndex):
         for ticker in tickers:
             try:
@@ -101,14 +105,11 @@ def _fetch_batched_intraday(tickers: list[str]) -> Dict[str, pd.DataFrame]:
                     if (metric, ticker) in df.columns:
                         sub_df[metric] = df[(metric, ticker)]
                 
-                # Drop rows where price is NaN
                 sub_df.dropna(subset=["Close"], inplace=True)
                 if not sub_df.empty:
                     result[ticker] = sub_df
             except Exception as e:
                 logger.warning(f"Error extracting sub-dataframe for {ticker}: {e}")
-
-    # Case B: Single ticker returned -> standard flat columns
     else:
         ticker = tickers[0]
         sub_df = df.copy()
