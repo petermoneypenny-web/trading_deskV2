@@ -9,6 +9,7 @@ from app.config import settings
 from app.api.routes import router
 from app.services.stream import run_intraday_tick_loop
 from app.services.alerts import send_ntfy_alert
+from app.services.scheduler import start_market_scheduler, stop_market_scheduler
 
 logging.basicConfig(
     level=logging.INFO,
@@ -20,10 +21,18 @@ logger = logging.getLogger("trading_desk_v2")
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Initializing Trading Desk V2 on port 5095...")
-    await send_ntfy_alert("Trading Desk V2 Online", "Container initialized on port 5095.")
+    await send_ntfy_alert("Trading Desk V2 Online", "Container initialized on port 5095 with automated market scheduler.")
+    
+    # Start APScheduler for automatic US Eastern market open/close
+    start_market_scheduler()
+    
+    # Start background data stream and risk cycle
     loop_task = asyncio.create_task(run_intraday_tick_loop())
+    
     yield
+    
     logger.info("Shutting down Trading Desk V2...")
+    stop_market_scheduler()
     loop_task.cancel()
     try:
         await loop_task

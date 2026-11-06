@@ -10,6 +10,8 @@ from app.services.buffer import buffer_manager
 from app.services.alerts import send_ntfy_alert
 from app.services.gemini_agent import evaluate_intraday_opportunity
 from app.services.risk_engine import open_position, close_position, liquidate_all_positions
+from app.services.scheduler import scheduler
+
 
 router = APIRouter()
 
@@ -33,6 +35,17 @@ async def health_check():
         "timestamp": datetime.utcnow().isoformat()
     }
 
+@router.get("/scheduler/jobs")
+async def get_scheduled_jobs():
+    jobs = []
+    for job in scheduler.get_jobs():
+        jobs.append({
+            "id": job.id,
+            "name": job.name,
+            "next_run_time": job.next_run_time.isoformat() if job.next_run_time else None,
+            "trigger": str(job.trigger)
+        })
+    return {"scheduler_running": scheduler.running, "jobs": jobs}
 
 @router.get("/status")
 async def get_system_status():
