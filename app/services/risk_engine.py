@@ -5,13 +5,12 @@ from datetime import datetime
 
 from app.core.state import system_state
 from app.config import settings
-from app.services.stream import send_ntfy_alert
+from app.services.alerts import send_ntfy_alert
 
 logger = logging.getLogger("trading_desk_v2.risk")
 
-# Risk Parameters
-MAX_DAILY_LOSS = 250.0        # Hard circuit breaker: Max allowable daily loss in USD
-MAX_RISK_PER_TRADE = 50.0     # Maximum dollars risked on a single trade entry
+MAX_DAILY_LOSS = 250.0
+MAX_RISK_PER_TRADE = 50.0
 DEFAULT_ACCOUNT_EQUITY = 10000.0
 
 
@@ -41,9 +40,7 @@ def init_db():
 
 
 def calculate_position_size(entry_price: float, stop_loss: float, risk_budget: float = MAX_RISK_PER_TRADE) -> int:
-    """
-    Calculates number of shares based on fixed dollar risk and stop loss distance.
-    """
+    """Calculates number of shares based on fixed dollar risk and stop loss distance."""
     per_share_risk = abs(entry_price - stop_loss)
     if per_share_risk <= 0.001:
         return 1
@@ -52,10 +49,7 @@ def calculate_position_size(entry_price: float, stop_loss: float, risk_budget: f
 
 
 async def check_daily_circuit_breaker() -> bool:
-    """
-    Checks if total daily losses exceed the maximum daily threshold.
-    Trips circuit breaker and pauses the trading engine if violated.
-    """
+    """Trips circuit breaker and pauses the trading engine if daily loss limit is exceeded."""
     total_daily_loss = system_state.daily_realized_pnl + system_state.daily_unrealized_pnl
     if total_daily_loss <= -MAX_DAILY_LOSS:
         if system_state.is_active:
@@ -68,9 +62,7 @@ async def check_daily_circuit_breaker() -> bool:
 
 
 async def open_position(ticker: str, action: str, entry_price: float, stop_loss: float, take_profit: float, reasoning: str):
-    """
-    Evaluates risk rules and opens a new intraday paper position.
-    """
+    """Evaluates risk rules and opens a new intraday paper position."""
     if await check_daily_circuit_breaker():
         logger.warning(f"Rejecting entry for {ticker}: Daily circuit breaker active.")
         return False
@@ -101,9 +93,7 @@ async def open_position(ticker: str, action: str, entry_price: float, stop_loss:
 
 
 async def close_position(ticker: str, exit_price: float, exit_reason: str):
-    """
-    Closes an active intraday position and logs the trade to SQLite.
-    """
+    """Closes an active intraday position and logs the trade to SQLite."""
     position = system_state.open_positions.pop(ticker, None)
     if not position:
         return
@@ -117,13 +107,12 @@ async def close_position(ticker: str, exit_price: float, exit_reason: str):
     if action == "BUY":
         pnl = (exit_price - entry_price) * shares
         pnl_pct = ((exit_price - entry_price) / entry_price) * 100.0
-    else:  # SELL / SHORT
+    else:
         pnl = (entry_price - exit_price) * shares
         pnl_pct = ((entry_price - exit_price) / entry_price) * 100.0
 
     system_state.daily_realized_pnl += pnl
 
-    # Save to SQLite database
     db_path = settings.DATABASE_URL.replace("sqlite:///", "")
     try:
         with sqlite3.connect(db_path) as conn:
@@ -143,9 +132,7 @@ async def close_position(ticker: str, exit_price: float, exit_reason: str):
 
 
 async def update_open_positions_and_risk(latest_quotes: Dict[str, Dict[str, Any]]):
-    """
-    Checks stop loss, take profit targets, and updates unrealized P&L for every active position.
-    """
+    """Checks stop loss, take profit targets, and updates unrealized P&L for every active position."""
     total_unrealized = 0.0
 
     for ticker in list(system_state.open_positions.keys()):
@@ -165,18 +152,15 @@ async def update_open_positions_and_risk(latest_quotes: Dict[str, Dict[str, Any]
         stop_loss = position["stop_loss"]
         take_profit = position["take_profit"]
 
-        # Calculate live unrealized PnL
         if action == "BUY":
             pos_pnl = (current_price - entry_price) * shares
-            # Check Stop Loss
             if current_price <= stop_loss:
                 await close_position(ticker, current_price, "STOP_LOSS_HIT")
                 continue
-            # Check Take Profit
             elif current_price >= take_profit:
                 await close_position(ticker, current_price, "TAKE_PROFIT_HIT")
                 continue
-        else:  # SHORT
+        else:
             pos_pnl = (entry_price - current_price) * shares
             if current_price >= stop_loss:
                 await close_position(ticker, current_price, "STOP_LOSS_HIT")
@@ -193,9 +177,7 @@ async def update_open_positions_and_risk(latest_quotes: Dict[str, Dict[str, Any]
 
 
 async def liquidate_all_positions(reason: str = "EOD_MANDATORY_CLOSE"):
-    """
-    Flattens all positions at the end of the day or upon manual command.
-    """
+    """Flattens all positions at the end of the day or upon manual command."""
     for ticker in list(system_state.open_positions.keys()):
         quote = system_state.latest_quotes.get(ticker)
         exit_price = quote["price"] if quote else system_state.open_positions[ticker]["current_price"]

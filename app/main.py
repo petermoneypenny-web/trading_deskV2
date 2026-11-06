@@ -4,7 +4,8 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from app.config import settings
 from app.api.routes import router
-from app.services.stream import run_intraday_tick_loop, send_ntfy_alert
+from app.services.stream import run_intraday_tick_loop
+from app.services.alerts import send_ntfy_alert
 
 logging.basicConfig(
     level=logging.INFO,

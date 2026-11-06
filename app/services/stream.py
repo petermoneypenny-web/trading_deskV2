@@ -2,7 +2,6 @@ import asyncio
 import logging
 from datetime import datetime
 from zoneinfo import ZoneInfo
-import httpx
 import yfinance as yf
 import pandas as pd
 
@@ -10,6 +9,7 @@ from app.core.state import system_state
 from app.services.buffer import buffer_manager
 from app.services.indicators import evaluate_intraday_technical_snapshot
 from app.services.gemini_agent import evaluate_intraday_opportunity
+from app.services.alerts import send_ntfy_alert
 from app.services.risk_engine import (
     init_db,
     open_position,
@@ -54,23 +54,6 @@ def _fetch_ticker_intraday(ticker: str) -> pd.DataFrame:
     return df
 
 
-async def send_ntfy_alert(title: str, message: str, priority: int = 3):
-    """Sends an alert notification to ntfy.sh under the configured topic."""
-    if not settings.NTFY_TOPIC:
-        return
-    url = f"{settings.NTFY_SERVER_URL.rstrip('/')}/{settings.NTFY_TOPIC}"
-    headers = {
-        "Title": title,
-        "Priority": str(priority),
-        "Tags": "chart_with_upwards_trend,rocket"
-    }
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            await client.post(url, content=message.encode("utf-8"), headers=headers)
-    except Exception as e:
-        logger.error(f"Failed to dispatch NTFY alert: {e}")
-
-
 async def sync_market_data():
     """Fetches intraday bars, updates buffers, evaluates setups, and manages execution."""
     for ticker in system_state.active_tickers:
@@ -88,12 +71,10 @@ async def sync_market_data():
                         "timestamp": last_bar["timestamp"]
                     }
 
-                # Evaluate indicators
                 buffer_df = buffer_manager.get_dataframe(ticker, interval="1m")
                 analysis = evaluate_intraday_technical_snapshot(buffer_df)
                 system_state.technical_analysis[ticker] = analysis
 
-                # Evaluate Gemini and execute during active trading phases
                 if system_state.is_active and system_state.session_phase in ("RTH_OPEN", "RTH_NORMAL"):
                     if analysis.get("signal") not in ("NEUTRAL", None):
                         decision = await evaluate_intraday_opportunity(
@@ -106,7 +87,6 @@ async def sync_market_data():
                             "decision": decision
                         }
 
-                        # Auto-execution condition: High confidence action with no current position
                         action = decision.get("action")
                         confidence = decision.get("confidence", 0)
                         if action in ("BUY", "SELL") and confidence >= 75 and ticker not in system_state.open_positions:
@@ -125,10 +105,8 @@ async def sync_market_data():
             logger.warning(error_msg)
             system_state.last_fetch_error = error_msg
 
-    # Update stop losses and unrealized PnL on every cycle
     await update_open_positions_and_risk(system_state.latest_quotes)
 
-    # Mandatory EOD Liquidation: Flatten all positions 15 minutes before market close
     if system_state.session_phase == "RTH_EOD_CLOSING" and system_state.open_positions:
         logger.info("RTH_EOD_CLOSING reached. Flattening all intraday positions.")
         await liquidate_all_positions(reason="RTH_EOD_AUTO_CLOSE")

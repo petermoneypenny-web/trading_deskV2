@@ -7,7 +7,7 @@ from datetime import datetime
 from app.core.state import system_state
 from app.config import settings
 from app.services.buffer import buffer_manager
-from app.services.stream import send_ntfy_alert
+from app.services.alerts import send_ntfy_alert
 from app.services.gemini_agent import evaluate_intraday_opportunity
 from app.services.risk_engine import open_position, close_position, liquidate_all_positions
 
@@ -16,7 +16,7 @@ router = APIRouter()
 
 class OrderRequest(BaseModel):
     ticker: str
-    action: str  # BUY or SELL
+    action: str
     entry_price: float
     stop_loss: float
     take_profit: float
@@ -82,7 +82,7 @@ async def close_single_position(ticker: str):
     ticker_upper = ticker.upper()
     if ticker_upper not in system_state.open_positions:
         raise HTTPException(status_code=404, detail=f"No active position found for {ticker_upper}")
-    
+
     quote = system_state.latest_quotes.get(ticker_upper)
     exit_price = quote["price"] if quote else system_state.open_positions[ticker_upper]["current_price"]
     await close_position(ticker_upper, exit_price, "MANUAL_CLOSE_API")
