@@ -7,7 +7,8 @@ from app.config import settings
 
 logger = logging.getLogger("trading_desk_v2.gemini")
 
-BASE_GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models"
+# Use stable v1 endpoint for gemini-1.5-flash
+BASE_GEMINI_URL = "https://generativelanguage.googleapis.com/v1/models"
 
 SYSTEM_INSTRUCTION = """You are an institutional intraday momentum trader and execution agent.
 Your objective is to evaluate real-time technical indicators, VWAP positioning, Opening Range Breakout (ORB) levels, and momentum metrics to issue precise day-trading decisions.
@@ -18,7 +19,7 @@ Rules:
 3. Short Entries: Price must be below VWAP or breaking down through key support.
 4. Risk-Reward Ratio: Minimum target reward must be at least 1.5x the risk distance (Entry to Stop Loss).
 5. Stop Loss: Anchor stops strictly around technical invalidation levels (e.g., VWAP cross, recent swing high/low, or 1.5x ATR).
-6. Response Format: You must output ONLY a valid JSON object matching the requested schema. No conversational filler or markdown fences.
+6. Response Format: Output strictly a valid raw JSON object matching the requested schema. No conversational preamble, explanation, or markdown fences.
 """
 
 DECISION_SCHEMA = {
@@ -107,26 +108,33 @@ Current Indicator Snapshot:
 - Algorithmic Signal: {signal}
 - Bias Score: {technical_analysis.get('bias_score', 0)}
 
-Determine action (BUY, SELL, or HOLD), dynamic stop loss, and target profit. Output strictly according to the specified schema."""
+Required JSON schema:
+{{
+  "action": "BUY" | "SELL" | "HOLD",
+  "confidence": 0-100,
+  "entry_price": float,
+  "stop_loss": float,
+  "take_profit": float,
+  "risk_reward_ratio": float,
+  "reasoning": "string"
+}}
+Return ONLY raw JSON."""
 
     payload = {
         "contents": [
             {
                 "role": "user",
-                "parts": [{"text": user_prompt}]
+                "parts": [{"text": f"{SYSTEM_INSTRUCTION}\n\n{user_prompt}"}]
             }
         ],
-        "system_instruction": {
-            "parts": [{"text": SYSTEM_INSTRUCTION}]
-        },
         "generationConfig": {
             "temperature": 0.1,
-            "response_mime_type": "application/json",
-            "response_schema": DECISION_SCHEMA
+            "response_mime_type": "application/json"
         }
     }
 
-    url = f"{BASE_GEMINI_URL}/{settings.GEMINI_MODEL}:generateContent?key={settings.GEMINI_API_KEY}"
+    model_name = getattr(settings, "GEMINI_MODEL", "gemini-1.5-flash")
+    url = f"{BASE_GEMINI_URL}/{model_name}:generateContent?key={settings.GEMINI_API_KEY}"
 
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
@@ -145,8 +153,16 @@ Determine action (BUY, SELL, or HOLD), dynamic stop loss, and target profit. Out
                 }
 
             result_data = response.json()
-            raw_text = result_data["candidates"][0]["content"]["parts"][0]["text"]
-            parsed_decision = json.loads(raw_text)
+            raw_text = result_data["candidates"][0]["content"]["parts"][0]["text"].strip()
+            # Clean possible markdown wrapping if returned
+            if raw_text.startswith("```json"):
+                raw_text = raw_text[7:]
+            if raw_text.startswith("```"):
+                raw_text = raw_text[3:]
+            if raw_text.endswith("```"):
+                raw_text = raw_text[:-3]
+
+            parsed_decision = json.loads(raw_text.strip())
             return parsed_decision
 
     except Exception as e:
