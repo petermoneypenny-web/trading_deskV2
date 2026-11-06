@@ -1,6 +1,7 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, Query, HTTPException
 from app.core.state import system_state
 from app.config import settings
+from app.services.buffer import buffer_manager
 from app.services.stream import send_ntfy_alert
 from datetime import datetime
 
@@ -24,10 +25,29 @@ async def get_system_status():
         "is_active": system_state.is_active,
         "session_phase": system_state.session_phase,
         "active_tickers": system_state.active_tickers,
+        "latest_quotes": system_state.latest_quotes,
         "open_positions_count": len(system_state.open_positions),
         "daily_realized_pnl": system_state.daily_realized_pnl,
         "daily_unrealized_pnl": system_state.daily_unrealized_pnl,
-        "last_loop_timestamp": system_state.last_loop_timestamp.isoformat() if system_state.last_loop_timestamp else None
+        "last_loop_timestamp": system_state.last_loop_timestamp.isoformat() if system_state.last_loop_timestamp else None,
+        "last_fetch_error": system_state.last_fetch_error
+    }
+
+
+@router.get("/buffer/{ticker}")
+async def get_ticker_buffer(ticker: str, interval: str = Query("1m", regex="^(1m|5m)$")):
+    ticker_upper = ticker.upper()
+    df = buffer_manager.get_dataframe(ticker_upper, interval=interval)
+    if df.empty:
+        raise HTTPException(status_code=404, detail=f"No buffer data found for {ticker_upper}")
+    
+    # Return recent 30 bars formatted as records
+    records = df.tail(30).reset_index().to_dict(orient="records")
+    return {
+        "ticker": ticker_upper,
+        "interval": interval,
+        "bars_count": len(df),
+        "recent_bars": records
     }
 
 
