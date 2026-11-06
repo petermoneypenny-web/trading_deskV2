@@ -1,0 +1,41 @@
+# Environment & Secrets (NEVER COMMIT)
+.env
+.env.*
+!.env.example
+secrets.json
+
+# Python Virtual Environments & Packages
+venv/
+.venv/
+env/
+ENV/
+build/
+dist/
+*.egg-info/
+
+# Python Cache & Bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+
+# Databases & Runtime Storage
+*.db
+*.sqlite
+*.sqlite3
+data/
+storage/
+
+# Logs & Runtime State
+logs/
+*.log
+*.pid
+
+# System & IDE Specific
+.DS_Store
+Thumbs.db
+.vscode/*
+!.vscode/settings.json
+!.vscode/launch.json
+.idea/

@@ -1,0 +1,1314 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>Trading Desk - Efficiency Hub</title>
+  <link rel="icon" type="image/svg+xml" href="/favicon.ico">
+  <style>
+    :root {
+      --bg-main: #0f172a;
+      --bg-card: #1e293b;
+      --border-color: #334155;
+      --text-main: #f8fafc;
+      --text-muted: #94a3b8;
+      --primary: #38bdf8;
+      --primary-hover: #0284c7;
+      --success: #22c55e;
+      --danger: #ef4444;
+      --warning: #f59e0b;
+      --card-inner: #0b1120;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+    body { background-color: var(--bg-main); color: var(--text-main); min-height: 100vh; overflow-x: hidden; }
+
+    .header-bar {
+      background-color: var(--bg-card);
+      border-bottom: 1px solid var(--border-color);
+      padding: 16px 24px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      position: sticky;
+      top: 0;
+      z-index: 20;
+    }
+    .header-bar h1 {
+      font-size: 1.15rem;
+      font-weight: 700;
+      color: var(--primary);
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .nav-tabs {
+      display: flex;
+      gap: 8px;
+    }
+    .tab-btn {
+      background: transparent;
+      border: 1px solid var(--border-color);
+      color: var(--text-muted);
+      padding: 7px 14px;
+      border-radius: 6px;
+      font-size: 0.82rem;
+      font-weight: 600;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      transition: all 0.2s;
+    }
+    .tab-btn:hover { color: var(--text-main); border-color: var(--primary); }
+    .tab-btn.active {
+      background-color: var(--primary);
+      color: #0f172a;
+      border-color: var(--primary);
+      font-weight: 700;
+    }
+    .tab-badge {
+      display: inline-block;
+      padding: 1px 6px;
+      border-radius: 10px;
+      font-size: 0.72rem;
+      background: rgba(15, 23, 42, 0.4);
+      color: inherit;
+    }
+
+    .content-area {
+      max-width: 1050px;
+      margin: 0 auto;
+      padding: 20px 16px 40px 16px;
+    }
+
+    .tab-pane { display: none; }
+    .tab-pane.active { display: block; }
+
+    .card {
+      background-color: var(--bg-card);
+      border: 1px solid var(--border-color);
+      border-radius: 12px;
+      padding: 24px;
+      box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.25);
+      margin-bottom: 24px;
+    }
+    .card-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 18px;
+      flex-wrap: wrap;
+      gap: 10px;
+    }
+    .card h2 { font-size: 1.25rem; }
+    .card p.desc { color: var(--text-muted); font-size: 0.88rem; line-height: 1.45; }
+
+    .action-btn {
+      width: 100%;
+      padding: 11px 16px;
+      background-color: var(--primary);
+      border: none;
+      border-radius: 8px;
+      color: #0f172a;
+      font-weight: 600;
+      font-size: 0.9rem;
+      cursor: pointer;
+      transition: background-color 0.2s;
+    }
+    .action-btn:hover { background-color: var(--primary-hover); }
+    .action-btn:disabled { background-color: var(--border-color); color: var(--text-muted); cursor: not-allowed; }
+
+    .status-msg { margin-top: 16px; padding: 12px; border-radius: 6px; font-size: 0.9rem; display: none; }
+    .status-msg.error { display: block; background-color: rgba(239, 68, 68, 0.15); border: 1px solid var(--danger); color: var(--danger); }
+    .status-msg.success { display: block; background-color: rgba(34, 197, 94, 0.15); border: 1px solid var(--success); color: var(--success); }
+
+    .section-title {
+      font-size: 0.85rem;
+      font-weight: 600;
+      margin-bottom: 10px;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+
+    .clear-btn {
+      background: transparent;
+      border: 1px solid var(--border-color);
+      color: var(--text-muted);
+      padding: 5px 12px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 0.75rem;
+      font-weight: 600;
+      transition: all 0.2s;
+      white-space: nowrap;
+    }
+    .clear-btn:hover { color: var(--text-main); border-color: var(--primary); }
+
+    .btn-tp-adjust {
+      background: rgba(56, 189, 248, 0.12);
+      border: 1px solid rgba(56, 189, 248, 0.4);
+      color: var(--primary);
+      padding: 4px 8px;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 0.72rem;
+      font-weight: 700;
+      transition: all 0.2s;
+      white-space: nowrap;
+    }
+    
+    .btn-sell {
+      background: rgba(239, 68, 68, 0.15);
+      border: 1px solid rgba(239, 68, 68, 0.4);
+      color: var(--danger);
+      padding: 4px 8px;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 0.72rem;
+      font-weight: 700;
+      transition: all 0.2s;
+      white-space: nowrap;
+      margin-left: 4px;
+    }
+    .btn-sell:hover {
+      background: var(--danger);
+      color: #ffffff;
+    }
+
+    .btn-tp-adjust:hover {
+      background: var(--primary);
+      color: #0f172a;
+    }
+
+    .trading-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+      gap: 16px;
+      margin-top: 14px;
+    }
+    .trade-card {
+      background: var(--card-inner);
+      border: 1px solid var(--border-color);
+      border-radius: 8px;
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .trade-card.killed { opacity: 0.85; border-color: var(--danger); }
+    .badge-pill {
+      display: inline-block;
+      padding: 3px 8px;
+      border-radius: 4px;
+      font-size: 0.75rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    .badge-pass { background: rgba(34, 197, 94, 0.15); color: var(--success); border: 1px solid var(--success); }
+    .badge-kill { background: rgba(239, 68, 68, 0.15); color: var(--danger); border: 1px solid var(--danger); }
+    .badge-shrink { background: rgba(245, 158, 11, 0.15); color: var(--warning); border: 1px solid var(--warning); }
+    .badge-auto { background: rgba(56, 189, 248, 0.15); color: var(--primary); border: 1px solid var(--primary); }
+
+    .table-responsive {
+      width: 100%;
+      overflow-x: auto;
+      margin-top: 12px;
+      -webkit-overflow-scrolling: touch;
+      border-radius: 8px;
+      border: 1px solid var(--border-color);
+    }
+    .data-table { width: 100%; border-collapse: collapse; font-size: 0.85rem; min-width: 780px; }
+    .data-table th, .data-table td { border: 1px solid var(--border-color); padding: 10px 12px; text-align: left; }
+    .data-table th { background: var(--card-inner); color: var(--text-muted); font-weight: 600; font-size: 0.78rem; text-transform: uppercase; }
+    .data-table tr:hover { background: rgba(255, 255, 255, 0.02); }
+
+    .custom-select, .custom-input {
+      background: var(--bg-main);
+      color: var(--text-main);
+      border: 1px solid var(--border-color);
+      padding: 7px 10px;
+      border-radius: 6px;
+      font-size: 0.85rem;
+    }
+
+    .cost-widget {
+      background: rgba(56, 189, 248, 0.06);
+      border: 1px solid rgba(56, 189, 248, 0.2);
+      border-radius: 8px;
+      padding: 12px 16px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-top: 14px;
+      font-size: 0.85rem;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+
+    /* Skeptic Histogram Styles */
+    .skeptic-widget {
+      background: var(--card-inner);
+      border: 1px solid var(--border-color);
+      border-radius: 8px;
+      padding: 18px 20px;
+      margin-top: 16px;
+      margin-bottom: 20px;
+    }
+    .skeptic-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      border-bottom: 1px solid var(--border-color);
+      padding-bottom: 12px;
+      margin-bottom: 14px;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .skeptic-badges {
+      display: flex;
+      gap: 8px;
+      font-size: 0.75rem;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    }
+    .skeptic-badge-pass {
+      padding: 3px 8px;
+      border-radius: 4px;
+      background: rgba(34, 197, 94, 0.15);
+      color: var(--success);
+      border: 1px solid var(--success);
+    }
+    .skeptic-badge-shrink {
+      padding: 3px 8px;
+      border-radius: 4px;
+      background: rgba(245, 158, 11, 0.15);
+      color: var(--warning);
+      border: 1px solid var(--warning);
+    }
+    .skeptic-badge-kill {
+      padding: 3px 8px;
+      border-radius: 4px;
+      background: rgba(239, 68, 68, 0.15);
+      color: var(--danger);
+      border: 1px solid var(--danger);
+    }
+    .skeptic-grid {
+      display: grid;
+      grid-template-columns: repeat(10, 1fr);
+      gap: 8px;
+      align-items: end;
+      height: 120px;
+      padding-bottom: 6px;
+    }
+    .skeptic-col {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: flex-end;
+      height: 100%;
+    }
+    .skeptic-bar {
+      width: 100%;
+      border-radius: 4px 4px 0 0;
+      transition: height 0.3s ease;
+      min-height: 4px;
+    }
+    .skeptic-bar-green { background: var(--success); }
+    .skeptic-bar-yellow { background: var(--warning); }
+    .skeptic-bar-red { background: var(--danger); }
+    .skeptic-col-val {
+      font-size: 0.68rem;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      color: var(--text-muted);
+      margin-bottom: 4px;
+    }
+    .skeptic-col-label {
+      font-size: 0.72rem;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      color: var(--text-muted);
+      margin-top: 6px;
+    }
+    .skeptic-legend {
+      display: flex;
+      justify-content: space-between;
+      font-size: 0.72rem;
+      color: var(--text-muted);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      margin-top: 8px;
+      border-top: 1px dashed var(--border-color);
+      padding-top: 6px;
+    }
+
+    .live-pulse {
+      display: inline-block;
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--success);
+      margin-right: 6px;
+      box-shadow: 0 0 8px var(--success);
+      animation: pulse 2s infinite;
+    }
+    @keyframes pulse {
+      0% { transform: scale(0.95); opacity: 0.8; }
+      50% { transform: scale(1.2); opacity: 1; }
+      100% { transform: scale(0.95); opacity: 0.8; }
+    }
+
+    .switch-container { display: flex; align-items: center; gap: 10px; }
+    .switch { position: relative; display: inline-block; width: 44px; height: 24px; }
+    .switch input { opacity: 0; width: 0; height: 0; }
+    .slider {
+      position: absolute;
+      cursor: pointer;
+      top: 0; left: 0; right: 0; bottom: 0;
+      background-color: var(--border-color);
+      transition: .3s;
+      border-radius: 24px;
+    }
+    .slider:before {
+      position: absolute;
+      content: "";
+      height: 18px;
+      width: 18px;
+      left: 3px;
+      bottom: 3px;
+      background-color: white;
+      transition: .3s;
+      border-radius: 50%;
+    }
+    input:checked + .slider { background-color: var(--success); }
+    input:checked + .slider:before { transform: translateX(20px); }
+
+    .stats-card-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 12px;
+      margin-bottom: 16px;
+    }
+    .stat-box {
+      background: var(--card-inner);
+      border: 1px solid var(--border-color);
+      border-radius: 8px;
+      padding: 14px 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .stat-label { font-size: 0.72rem; text-transform: uppercase; color: var(--text-muted); font-weight: 700; }
+    .stat-val { font-size: 1.4rem; font-weight: 800; color: var(--text-main); }
+
+    @media (max-width: 768px) {
+      .header-bar { flex-direction: column; gap: 12px; align-items: flex-start; }
+      .content-area { padding: 12px 10px; }
+      .card { padding: 16px 14px; border-radius: 10px; }
+      .trading-grid { grid-template-columns: 1fr; }
+      .desk-controls-flex { flex-direction: column; align-items: stretch !important; }
+      .desk-controls-flex > div { width: 100%; }
+      .desk-controls-flex select,
+      .desk-controls-flex input,
+      .desk-controls-flex button { width: 100% !important; }
+      .cost-widget { flex-direction: column; align-items: flex-start; }
+    }
+  </style>
+</head>
+<body>
+
+  <header class="header-bar">
+    <h1>
+      <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+        <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon>
+      </svg>
+      Autonomous Trading Desk
+    </h1>
+
+    <div class="nav-tabs">
+      <button id="tabBtnLive" class="tab-btn active" onclick="switchTab('live')">
+        Live Cockpit
+        <span id="openCountBadge" class="tab-badge">0</span>
+      </button>
+      <button id="tabBtnLedger" class="tab-btn" onclick="switchTab('ledger')">
+        Historical Ledger (>24h)
+        <span id="historyCountBadge" class="tab-badge">0</span>
+      </button>
+    </div>
+  </header>
+
+  <main class="content-area">
+
+    <!-- ==================== TAB 1: LIVE COCKPIT ==================== -->
+    <div id="tabPaneLive" class="tab-pane active">
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <h2>Market Scanner &amp; Active Execution</h2>
+            <p class="desc">Autonomous scanning, risk-gated entry generation, and live open position tracking.</p>
+          </div>
+        </div>
+
+        <!-- Master Controls Box -->
+        <div style="background: var(--card-inner); border: 1px solid var(--border-color); border-radius: 8px; padding: 16px; margin-bottom: 16px;">
+          <div class="desk-controls-flex" style="display: flex; gap: 16px; align-items: center; flex-wrap: wrap;">
+            
+            <!-- Universe Selector -->
+            <div>
+              <label for="universeSelect" style="display:block; font-size: 0.75rem; color: var(--text-muted); font-weight: 700; text-transform: uppercase; margin-bottom: 5px;">Scan Universe:</label>
+              <select id="universeSelect" class="custom-select" onchange="updateCostEstimate()">
+                <option value="TOP50_VOLUME" selected>Top 50 Volume Leaders</option>
+                <option value="NASDAQ100">NASDAQ 100 Index</option>
+                <option value="SP500">S&amp;P 500 Index</option>
+                <option value="CUSTOM_WATCHLIST">Custom Watchlist (CSV)</option>
+              </select>
+            </div>
+
+            <!-- Auto-Interval Selector -->
+            <div>
+              <label for="intervalSelect" style="display:block; font-size: 0.75rem; color: var(--text-muted); font-weight: 700; text-transform: uppercase; margin-bottom: 5px;">Interval:</label>
+              <select id="intervalSelect" class="custom-select" onchange="updateCostEstimate()">
+                <option value="1">Every 1 Hour</option>
+                <option value="2">Every 2 Hours</option>
+                <option value="4" selected>Every 4 Hours</option>
+                <option value="8">Every 8 Hours</option>
+              </select>
+            </div>
+
+            <!-- Auto-Execute Toggle Switch -->
+            <div style="display: flex; flex-direction: column; gap: 5px;">
+              <span style="font-size: 0.75rem; color: var(--text-muted); font-weight: 700; text-transform: uppercase;">Auto-Execute:</span>
+              <div class="switch-container">
+                <label class="switch">
+                  <input type="checkbox" id="autoExecuteToggle" onchange="toggleAutoExecute(this.checked)">
+                  <span class="slider"></span>
+                </label>
+                <span id="autoExecuteLabel" style="font-size: 0.82rem; font-weight: 600; color: var(--text-muted);">OFF</span>
+              </div>
+            </div>
+
+            <!-- Auto-Scan Toggle Button -->
+            <div style="margin-top: 18px;">
+              <button id="toggleSchedulerBtn" style="background: var(--primary); color: #0f172a; border: none; padding: 9px 14px; border-radius: 6px; font-size: 0.85rem; font-weight: 700; cursor: pointer;" onclick="toggleAutoScanner()">
+                Start Auto-Scan
+              </button>
+            </div>
+
+            <!-- Manual Run Button -->
+            <div style="margin-top: 18px; flex-grow: 1;">
+              <button id="tradingScanBtn" class="action-btn" style="padding: 9px 14px; font-size: 0.85rem;" onclick="triggerTradingScan()">
+                🔍 Run Manual Scan Now
+              </button>
+            </div>
+
+          </div>
+
+          <!-- ntfy Push Notification Setting Bar -->
+          <div style="display: flex; gap: 10px; align-items: center; margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--border-color); flex-wrap: wrap;">
+            <label for="ntfyTopicInput" style="font-size: 0.82rem; color: var(--text-muted); font-weight: 600;">📱 Mobile Push Topic (ntfy.sh/):</label>
+            <input type="text" id="ntfyTopicInput" class="custom-input" placeholder="e.g. cm-hub-desk-8492" style="width: 220px;" />
+            <button style="background: var(--bg-main); border: 1px solid var(--border-color); color: var(--text-main); padding: 7px 12px; border-radius: 6px; font-size: 0.82rem; font-weight: 600; cursor: pointer;" onclick="saveNtfyTopic()">
+              Save Topic
+            </button>
+            <span id="ntfySavedConfirm" style="font-size: 0.78rem; color: var(--success); display: none;">Saved &amp; Test Push Sent!</span>
+          </div>
+
+          <!-- Cost Estimator Widget -->
+          <div class="cost-widget">
+            <div>
+              <strong style="color: var(--primary);">Estimated Gemini API Cost (1 Week):</strong>
+              <span id="costEstimateText" style="margin-left: 8px; color: var(--text-main); font-weight: 600;">~$0.11 (~£0.09)</span>
+            </div>
+            <div style="font-size: 0.75rem; color: var(--text-muted);">
+              Based on top 8 outliers / ~5 trading days
+            </div>
+          </div>
+        </div>
+
+        <div id="schedulerStatusBanner" style="font-size: 0.82rem; color: var(--text-muted); margin-bottom: 12px;">
+          Auto-Scheduler: <strong>Inactive</strong>
+        </div>
+
+        <div id="tradingStatus" class="status-msg"></div>
+
+        <!-- Skeptic Risk Score Distribution Widget -->
+        <div class="skeptic-widget">
+          <div class="skeptic-header">
+            <div style="display: flex; align-items: center; gap: 8px;">
+              <span style="font-size: 1.1rem;">🛡️</span>
+              <strong style="font-size: 0.9rem; color: var(--text-main);">Skeptic Risk Score Distribution</strong>
+            </div>
+            <div class="skeptic-badges">
+              <span id="badge-pass" class="skeptic-badge-pass">PASS: 0</span>
+              <span id="badge-shrink" class="skeptic-badge-shrink">SHRINK: 0</span>
+              <span id="badge-kill" class="skeptic-badge-kill">KILL: 0</span>
+            </div>
+          </div>
+
+          <div id="skeptic-bars-container" class="skeptic-grid">
+            <!-- Dynamically populated by refreshSkepticDistribution() -->
+          </div>
+
+          <div class="skeptic-legend">
+            <span>Score 1 (Safest)</span>
+            <span>Score 6 (Gate Cutoff)</span>
+            <span>Score 10 (Fatal Flaw / KILL)</span>
+          </div>
+        </div>
+
+        <!-- 1. Open Positions Section -->
+        <div class="section-title" style="margin-top: 28px;">
+          <div style="display: flex; align-items: center;">
+            <span class="live-pulse"></span>
+            <span>Active Open Positions</span>
+            <span id="lastSyncedTime" style="margin-left: 10px; font-size: 0.75rem; color: var(--text-muted); font-weight: normal;">(Auto-guarding every 30s)</span>
+          </div>
+          <button class="clear-btn" onclick="loadTradingJournal()">Sync Prices Now</button>
+        </div>
+
+        <div class="table-responsive">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>Entry Date</th>
+                <th>Ticker</th>
+                <th>Action</th>
+                <th>Entry</th>
+                <th>Stop-Loss</th>
+                <th>Current Price</th>
+                <th>Take-Profit</th>
+                <th>Size ($)</th>
+                <th>R/R</th>
+                <th>Status</th>
+                <th style="text-align: center;">Actions</th>
+              </tr>
+            </thead>
+            <tbody id="openPositionsTableBody">
+              <tr>
+                <td colspan="11" style="text-align: center; color: var(--text-muted);">No open positions active.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <!-- 2. Recent Session Exits (< 24 Hours) Section -->
+        <div class="section-title" style="margin-top: 32px;">
+          <div style="display: flex; align-items: center; gap: 8px;">
+            <span>Recent Session Exits (&lt; 24h)</span>
+            <span id="recentClosedCount" style="font-size: 0.75rem; color: var(--text-muted); font-weight: normal;"></span>
+          </div>
+        </div>
+
+        <div class="table-responsive">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>Exit Date</th>
+                <th>Ticker</th>
+                <th>Action</th>
+                <th>Entry</th>
+                <th>Exit Price</th>
+                <th>PnL ($)</th>
+                <th>Exit Reason</th>
+                <th>Status</th>
+              </tr>
+            </thead>
+            <tbody id="recentClosedTableBody">
+              <tr>
+                <td colspan="8" style="text-align: center; color: var(--text-muted);">No exits recorded within the last 24 hours.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <!-- 3. Decision Cards Section -->
+        <div class="section-title" style="margin-top: 36px;">
+          <div style="display:flex; align-items:center; gap:8px;">
+            <span>Agent Decision Cards</span>
+            <span id="lastCardScanTime" style="font-size:0.75rem; color:var(--text-muted); font-weight:normal;"></span>
+          </div>
+          <button class="clear-btn" onclick="fetchLatestCards()">Refresh Cards</button>
+        </div>
+        <div id="tradingCardsContainer" class="trading-grid">
+          <p style="color: var(--text-muted); font-size: 0.88rem;">No active cards. Run the scanner above to evaluate market opportunities.</p>
+        </div>
+
+      </div>
+    </div>
+
+    <!-- ==================== TAB 2: HISTORICAL ARCHIVE ==================== -->
+    <div id="tabPaneLedger" class="tab-pane">
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <h2>Historical Trade Ledger</h2>
+            <p class="desc">Closed trade performance archive (&gt; 24 hours old) with cumulative trade statistics.</p>
+          </div>
+          <div>
+            <button class="clear-btn" onclick="exportJournalCsv()">📥 Export journal.csv</button>
+          </div>
+        </div>
+
+        <!-- Stats Overview Grid -->
+        <div class="stats-card-grid">
+          <div class="stat-box">
+            <span class="stat-label">Total Realized PnL</span>
+            <span id="histTotalPnl" class="stat-val">$0.00</span>
+          </div>
+          <div class="stat-box">
+            <span class="stat-label">Win Rate</span>
+            <span id="histWinRate" class="stat-val">0%</span>
+          </div>
+          <div class="stat-box">
+            <span class="stat-label">Closed Trades</span>
+            <span id="histTotalClosed" class="stat-val">0</span>
+          </div>
+          <div class="stat-box">
+            <span class="stat-label">Profit Factor</span>
+            <span id="histProfitFactor" class="stat-val">0.00</span>
+          </div>
+        </div>
+
+        <!-- Filter Controls -->
+        <div style="display: flex; gap: 12px; margin-bottom: 14px; flex-wrap: wrap;">
+          <input type="text" id="historySearchInput" class="custom-input" placeholder="Search ticker..." style="width: 180px;" oninput="applyHistoryFilters()">
+          <select id="historyOutcomeFilter" class="custom-select" onchange="applyHistoryFilters()">
+            <option value="ALL">All Outcomes</option>
+            <option value="PROFIT">Take Profit Only</option>
+            <option value="STOP">Stop Loss Only</option>
+          </select>
+        </div>
+
+        <!-- Archive Table -->
+        <div class="table-responsive">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>Trade ID</th>
+                <th>Exit Date</th>
+                <th>Ticker</th>
+                <th>Action</th>
+                <th>Entry</th>
+                <th>Exit Price</th>
+                <th>PnL ($)</th>
+                <th>Outcome Reason</th>
+                <th>Core Reasons / Catalyst</th>
+              </tr>
+            </thead>
+            <tbody id="historyTableBody">
+              <tr>
+                <td colspan="9" style="text-align: center; color: var(--text-muted);">No archived trades older than 24 hours.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+      </div>
+    </div>
+
+  </main>
+
+  <script>
+    let tradingPollingInterval = null;
+    let lastRenderedScanTime = null;
+    let cachedArchivedTrades = [];
+
+    function switchTab(tabName) {
+      const liveBtn = document.getElementById('tabBtnLive');
+      const ledgerBtn = document.getElementById('tabBtnLedger');
+      const livePane = document.getElementById('tabPaneLive');
+      const ledgerPane = document.getElementById('tabPaneLedger');
+
+      if (tabName === 'live') {
+        liveBtn.classList.add('active');
+        ledgerBtn.classList.remove('active');
+        livePane.classList.add('active');
+        ledgerPane.classList.remove('active');
+      } else {
+        ledgerBtn.classList.add('active');
+        liveBtn.classList.remove('active');
+        ledgerPane.classList.add('active');
+        livePane.classList.remove('active');
+        renderHistoryTable(cachedArchivedTrades);
+      }
+    }
+
+    function initTradingDesk() {
+      loadTradingJournal();
+      fetchSchedulerStatus();
+      fetchLatestCards();
+      fetchNtfyTopic();
+      fetchAutoExecuteConfig();
+      updateCostEstimate();
+      refreshSkepticDistribution();
+
+      if (!tradingPollingInterval) {
+        tradingPollingInterval = setInterval(() => {
+          loadTradingJournal();
+          fetchSchedulerStatus();
+          fetchLatestCards();
+          refreshSkepticDistribution();
+        }, 15000);
+      }
+    }
+
+    async function refreshSkepticDistribution() {
+      try {
+        const res = await fetch('/api/trading/skeptic-distribution');
+        if (!res.ok) return;
+        const data = await res.json();
+
+        const d = data.decisions || {};
+        document.getElementById('badge-pass').textContent = `PASS: ${d.PASS || 0}`;
+        document.getElementById('badge-shrink').textContent = `SHRINK: ${d.SHRINK || 0}`;
+        document.getElementById('badge-kill').textContent = `KILL: ${d.KILL || 0}`;
+
+        const dist = data.score_distribution || {};
+        const total = data.total_evaluations || 0;
+        const container = document.getElementById('skeptic-bars-container');
+        if (!container) return;
+        container.innerHTML = '';
+
+        for (let i = 1; i <= 10; i++) {
+          const count = dist[i.toString()] || 0;
+          const pct = total > 0 ? Math.round((count / total) * 100) : 0;
+          const barHeight = count > 0 ? Math.max(10, pct) : 4;
+
+          let colorClass = 'skeptic-bar-green';
+          if (i > 4 && i <= 6) colorClass = 'skeptic-bar-yellow';
+          if (i > 6) colorClass = 'skeptic-bar-red';
+
+          const colDiv = document.createElement('div');
+          colDiv.className = 'skeptic-col';
+          colDiv.innerHTML = `
+            <div class="skeptic-col-val">${count}</div>
+            <div class="skeptic-bar ${colorClass}" style="height: ${barHeight}%;"></div>
+            <div class="skeptic-col-label">${i}</div>
+          `;
+          container.appendChild(colDiv);
+        }
+      } catch (err) {
+        console.error("Failed to load skeptic stats:", err);
+      }
+    }
+
+    function updateCostEstimate() {
+      const interval = parseInt(document.getElementById('intervalSelect').value, 10);
+      const runsPerDay = Math.floor(7 / interval) || 1;
+      const runsPerWeek = runsPerDay * 5;
+      const costPerRun = 0.011;
+      const weeklyCostUSD = (runsPerWeek * costPerRun).toFixed(2);
+      const weeklyCostGBP = (weeklyCostUSD * 0.79).toFixed(2);
+      document.getElementById('costEstimateText').textContent = `~$${weeklyCostUSD} (~£${weeklyCostGBP})`;
+    }
+
+    async function fetchNtfyTopic() {
+      try {
+        const res = await fetch('/api/trading/ntfy/config');
+        const data = await res.json();
+        if (data.ntfy_topic) {
+          document.getElementById('ntfyTopicInput').value = data.ntfy_topic;
+        }
+      } catch (err) {}
+    }
+
+    async function saveNtfyTopic() {
+      const topic = document.getElementById('ntfyTopicInput').value.trim();
+      const confirmSpan = document.getElementById('ntfySavedConfirm');
+      if (!topic) return;
+
+      try {
+        await fetch('/api/trading/ntfy/config', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ntfy_topic: topic })
+        });
+        confirmSpan.style.display = 'inline';
+        setTimeout(() => { confirmSpan.style.display = 'none'; }, 4000);
+      } catch (err) {
+        alert('Failed to save ntfy topic');
+      }
+    }
+
+    async function fetchAutoExecuteConfig() {
+      try {
+        const res = await fetch('/api/trading/auto-execute/config');
+        const data = await res.json();
+        const toggle = document.getElementById('autoExecuteToggle');
+        const label = document.getElementById('autoExecuteLabel');
+        toggle.checked = !!data.auto_execute;
+        label.textContent = toggle.checked ? 'ON' : 'OFF';
+        label.style.color = toggle.checked ? 'var(--success)' : 'var(--text-muted)';
+      } catch (err) {}
+    }
+
+    async function toggleAutoExecute(enabled) {
+      const label = document.getElementById('autoExecuteLabel');
+      label.textContent = enabled ? 'ON' : 'OFF';
+      label.style.color = enabled ? 'var(--success)' : 'var(--text-muted)';
+
+      try {
+        await fetch('/api/trading/auto-execute/config', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ enabled: enabled })
+        });
+      } catch (err) {
+        alert('Failed to update auto-execute setting');
+      }
+    }
+
+    async function fetchLatestCards() {
+      try {
+        const res = await fetch('/api/trading/latest-scan');
+        const data = await res.json();
+        if (data.timestamp && data.timestamp !== lastRenderedScanTime) {
+          lastRenderedScanTime = data.timestamp;
+          const timeSpan = document.getElementById('lastCardScanTime');
+          if (timeSpan) {
+            timeSpan.textContent = `(Scanned: ${data.timestamp} - ${data.universe})`;
+          }
+          renderTradingResults(data.results || []);
+        }
+      } catch (err) {}
+    }
+
+    async function triggerTradingScan() {
+      const scanBtn = document.getElementById('tradingScanBtn');
+      const statusDiv = document.getElementById('tradingStatus');
+      const universe = document.getElementById('universeSelect').value;
+
+      scanBtn.disabled = true;
+      scanBtn.textContent = 'Scout Scanning & Gemini Evaluating...';
+      statusDiv.className = 'status-msg';
+      statusDiv.style.display = 'none';
+
+      try {
+        const response = await fetch('/api/trading/scan', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ universe: universe })
+        });
+
+        const data = await response.json();
+        lastRenderedScanTime = new Date().toLocaleTimeString();
+        document.getElementById('lastCardScanTime').textContent = `(Manual Scan: ${lastRenderedScanTime})`;
+        renderTradingResults(data.results || []);
+        loadTradingJournal();
+        refreshSkepticDistribution();
+      } catch (err) {
+        statusDiv.className = 'status-msg error';
+        statusDiv.textContent = 'Scan error: ' + err.message;
+      } finally {
+        scanBtn.disabled = false;
+        scanBtn.textContent = '🔍 Run Manual Scan Now';
+      }
+    }
+
+    function renderTradingResults(results) {
+      const container = document.getElementById('tradingCardsContainer');
+      container.innerHTML = '';
+
+      if (!results || results.length === 0) {
+        container.innerHTML = '<p style="color: var(--text-muted); font-size: 0.88rem;">No volume or price anomalies detected in this universe.</p>';
+        return;
+      }
+
+      results.forEach(item => {
+        const cardDiv = document.createElement('div');
+        const isApproved = item.approved_for_trade;
+        cardDiv.className = `trade-card ${isApproved ? '' : 'killed'}`;
+
+        if (!isApproved) {
+          const price = item.candidate.current_price;
+          const risk = item.skeptic.risk_score_1_to_10;
+          const decision = (item.skeptic.decision || 'KILL').toUpperCase();
+          const pricePass = price >= 10.0;
+          const riskPass = risk <= 6 && (decision === 'PASS' || decision === 'SHRINK');
+          const slPass = false;
+          const rrPass = false;
+
+          const badge = (pass) => pass 
+            ? '<span style="color:var(--success); font-weight:700;">PASS</span>' 
+            : '<span style="color:var(--danger); font-weight:700;">FAIL</span>';
+
+          cardDiv.innerHTML = `
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+              <h3>${item.candidate.ticker}</h3>
+              <span class="badge-pill badge-kill">${decision}</span>
+            </div>
+            <p style="font-size: 0.84rem; color: var(--text-muted); margin: 6px 0;">${item.skeptic.adversarial_take || item.skeptic.kill_reason || 'Risk parameters failed'}</p>
+            
+            <div style="background: rgba(15, 23, 42, 0.6); border: 1px solid var(--border-color); border-radius: 6px; padding: 10px; font-size: 0.78rem; display: flex; flex-direction: column; gap: 4px; margin-top: 6px;">
+              <div style="display:flex; justify-content:space-between;">
+                <span>Price &ge; $10.00: <strong>$${price}</strong></span>
+                ${badge(pricePass)}
+              </div>
+              <div style="display:flex; justify-content:space-between;">
+                <span>Skeptic PASS/SHRINK &amp; Risk &le; 6/10: <strong>${risk}/10 (${decision})</strong></span>
+                ${badge(riskPass)}
+              </div>
+              <div style="display:flex; justify-content:space-between;">
+                <span>Defined Stop-Loss (&le; 1.8x ATR): <strong>None</strong></span>
+                ${badge(slPass)}
+              </div>
+              <div style="display:flex; justify-content:space-between;">
+                <span>Min Risk/Reward &ge; 1.4: <strong>0.00</strong></span>
+                ${badge(rrPass)}
+              </div>
+            </div>
+          `;
+        } else {
+          const c = item.card;
+          const badgeClass = item.skeptic.decision === 'SHRINK' ? 'badge-shrink' : 'badge-pass';
+          const autoBadge = item.auto_purchased ? '<span class="badge-pill badge-auto">⚡ AUTO-PURCHASED</span>' : '';
+          const actionBtn = item.auto_purchased
+            ? '<button class="action-btn" style="padding: 8px; margin-top: 8px; background: var(--border-color); color: var(--text-muted); cursor: default;" disabled>Order Already Logged</button>'
+            : `<button class="action-btn" style="padding: 8px; margin-top: 8px; background: var(--success); color: #0f172a;" onclick='executePaperTrade(${JSON.stringify(c)})'>Approve Paper Order</button>`;
+
+          cardDiv.innerHTML = `
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+              <h3 style="color: var(--primary);">${c.ticker}</h3>
+              <div style="display: flex; gap: 6px;">
+                ${autoBadge}
+                <span class="badge-pill ${badgeClass}">${c.action} (${item.skeptic.decision})</span>
+              </div>
+            </div>
+            <div style="font-size: 0.85rem; color: var(--text-main); line-height: 1.5;">
+              <div><strong>Entry:</strong> $${c.entry_price} | <strong>Stop:</strong> $${c.stop_loss}</div>
+              <div><strong>Target:</strong> $${c.take_profit} | <strong>R/R:</strong> ${c.risk_reward_ratio || c.risk_reward}</div>
+              <div><strong>Position Size:</strong> $${c.position_size_usd}</div>
+            </div>
+            <p style="font-size: 0.8rem; color: var(--text-muted); margin-top: 4px;">
+              <strong>Catalyst:</strong> ${item.analyst.catalyst_summary}
+            </p>
+            ${actionBtn}
+          `;
+        }
+        container.appendChild(cardDiv);
+      });
+    }
+
+    async function executePaperTrade(cardData) {
+      await fetch('/api/trading/execute', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(cardData)
+      });
+      loadTradingJournal();
+    }
+
+    async function sellPosition(identifier) {
+      try {
+        const res = await fetch('/api/trading/position/sell', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ identifier: identifier })
+        });
+        const data = await res.json();
+        if (data.status === 'success') {
+          await loadTradingJournal();
+        } else {
+          alert('Could not sell position: ' + (data.detail || 'Unknown error'));
+        }
+      } catch (err) {
+        alert('Error selling position: ' + err.message);
+      }
+    }
+
+    async function adjustTakeProfit(identifier) {
+      try {
+        const res = await fetch('/api/trading/position/adjust-tp', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ identifier: identifier, reduction_pct: 0.01 })
+        });
+        const data = await res.json();
+        if (data.status === 'success') {
+          await loadTradingJournal();
+        } else {
+          alert('Could not adjust Take Profit: ' + (data.detail || 'Unknown error'));
+        }
+      } catch (err) {
+        alert('Error adjusting Take Profit: ' + err.message);
+      }
+    }
+
+    function getPriceColor(current, entry, stopLoss, takeProfit, isShort = false) {
+      const colorAmber = [245, 158, 11];
+      const colorGreen = [34, 197, 94];
+      const colorRed   = [239, 68, 68];
+
+      let t = 0;
+      let startColor = colorAmber;
+      let endColor = colorAmber;
+
+      if (!isShort) {
+        if (current >= entry) {
+          const range = takeProfit - entry;
+          t = range > 0 ? (current - entry) / range : 0;
+          startColor = colorAmber;
+          endColor = colorGreen;
+        } else {
+          const range = entry - stopLoss;
+          t = range > 0 ? (entry - current) / range : 0;
+          startColor = colorAmber;
+          endColor = colorRed;
+        }
+      } else {
+        if (current <= entry) {
+          const range = entry - takeProfit;
+          t = range > 0 ? (entry - current) / range : 0;
+          startColor = colorAmber;
+          endColor = colorGreen;
+        } else {
+          const range = stopLoss - entry;
+          t = range > 0 ? (current - entry) / range : 0;
+          startColor = colorAmber;
+          endColor = colorRed;
+        }
+      }
+
+      t = Math.max(0, Math.min(1, t));
+
+      const r = Math.round(startColor[0] + (endColor[0] - startColor[0]) * t);
+      const g = Math.round(startColor[1] + (endColor[1] - startColor[1]) * t);
+      const b = Math.round(startColor[2] + (endColor[2] - startColor[2]) * t);
+
+      return `rgb(${r}, ${g}, ${b})`;
+    }
+
+    async function loadTradingJournal() {
+      try {
+        await fetch('/api/trading/check-positions');
+        const res = await fetch('/api/trading/trades/categorized');
+        const data = await res.json();
+
+        const syncSpan = document.getElementById('lastSyncedTime');
+        if (syncSpan) syncSpan.textContent = `(Synced: ${new Date().toLocaleTimeString()})`;
+
+        // 1. Update Open Positions
+        const openBody = document.getElementById('openPositionsTableBody');
+        const openTrades = data.open_trades || [];
+        document.getElementById('openCountBadge').textContent = openTrades.length;
+
+        if (openTrades.length === 0) {
+          openBody.innerHTML = '<tr><td colspan="11" style="text-align: center; color: var(--text-muted);">No open positions active.</td></tr>';
+        } else {
+          openBody.innerHTML = '';
+          openTrades.forEach(t => {
+            const entry = parseFloat(t.entry_price) || 0;
+            const stopLoss = parseFloat(t.stop_loss) || 0;
+            const takeProfit = parseFloat(t.take_profit) || 0;
+            const positionSizeUsd = parseFloat(t.position_size_usd) || 0;
+
+            const rawCurrent = t.current_price ?? t.last_price ?? t.market_price ?? t.price ?? null;
+            const hasLivePrice = rawCurrent !== null && rawCurrent !== undefined && rawCurrent !== '' && !isNaN(parseFloat(rawCurrent));
+            const currentPrice = hasLivePrice ? parseFloat(rawCurrent) : entry;
+
+            const isShort = (t.action || '').toUpperCase().includes('SELL') || (t.action || '').toUpperCase().includes('SHORT');
+            const dynamicColor = getPriceColor(currentPrice, entry, stopLoss, takeProfit, isShort);
+
+            let unrealizedPnlHtml = '';
+            if (entry > 0 && positionSizeUsd > 0) {
+              const shares = positionSizeUsd / entry;
+              const unRealizedPnl = isShort ? (entry - currentPrice) * shares : (currentPrice - entry) * shares;
+              const pnlSign = unRealizedPnl >= 0 ? '+$' : '-$';
+              const pnlColor = unRealizedPnl >= 0 ? 'var(--success)' : 'var(--danger)';
+              unrealizedPnlHtml = `<div style="font-size:0.72rem; font-weight:600; color:${pnlColor};">${pnlSign}${Math.abs(unRealizedPnl).toFixed(2)}</div>`;
+            }
+
+            const idParam = t.trade_id || t.ticker;
+
+            openBody.innerHTML += `<tr>
+              <td>${t.timestamp}</td>
+              <td style="font-weight:700; color:var(--primary);">${t.ticker}</td>
+              <td>${t.action}</td>
+              <td>$${entry.toFixed(2)}</td>
+              <td style="color:var(--danger);">$${stopLoss.toFixed(2)}</td>
+              <td style="font-weight:700; color:${dynamicColor};">
+                $${currentPrice.toFixed(2)}
+                ${unrealizedPnlHtml}
+              </td>
+              <td style="color:var(--success); font-weight:600;">$${takeProfit.toFixed(2)}</td>
+              <td>$${t.position_size_usd}</td>
+              <td>${t.risk_reward_ratio || t.risk_reward || '--'}</td>
+              <td><span class="badge-pill badge-shrink">OPEN</span></td>
+              <td style="text-align: center;">
+                <div style="display: inline-flex; gap: 4px;">
+                  <button class="btn-tp-adjust" title="Lower Take-Profit target by 1%" onclick="adjustTakeProfit('${idParam}')">
+                    🎯 -1% TP
+                  </button>
+                  <button class="btn-sell" title="Market sell position now" onclick="sellPosition('${idParam}')">
+                    Sell
+                  </button>
+                </div>
+              </td>
+            </tr>`;
+          });
+        }
+
+        // 2. Update Recent Closed (< 24h)
+        const recentBody = document.getElementById('recentClosedTableBody');
+        const recentTrades = data.recent_closed_24h || [];
+        document.getElementById('recentClosedCount').textContent = `(${recentTrades.length} trades)`;
+
+        if (recentTrades.length === 0) {
+          recentBody.innerHTML = '<tr><td colspan="8" style="text-align: center; color: var(--text-muted);">No exits recorded within the last 24 hours.</td></tr>';
+        } else {
+          recentBody.innerHTML = '';
+          recentTrades.forEach(t => {
+            const pnl = parseFloat(t.realized_pnl ?? t.pnl_usd ?? 0);
+            const isWin = pnl >= 0;
+            recentBody.innerHTML += `<tr>
+              <td>${t.exit_timestamp || t.timestamp}</td>
+              <td style="font-weight:700; color:var(--primary);">${t.ticker}</td>
+              <td>${t.action}</td>
+              <td>$${t.entry_price}</td>
+              <td>$${t.exit_price || '--'}</td>
+              <td style="font-weight:700; color:${isWin ? 'var(--success)' : 'var(--danger)'};">${isWin ? '+$' : '-$'}${Math.abs(pnl).toFixed(2)}</td>
+              <td>${t.exit_reason || 'CLOSED'}</td>
+              <td><span class="badge-pill ${isWin ? 'badge-pass' : 'badge-kill'}">CLOSED</span></td>
+            </tr>`;
+          });
+        }
+
+        // 3. Cache Historical Archive (> 24h) and calculate stats
+        cachedArchivedTrades = data.archived_trades_over_24h || [];
+        document.getElementById('historyCountBadge').textContent = cachedArchivedTrades.length;
+        computeArchiveStats(data.all_closed_trades || []);
+        applyHistoryFilters();
+
+      } catch (e) {
+        console.error("Journal refresh error:", e);
+      }
+    }
+
+    function computeArchiveStats(allClosed) {
+      let totalPnl = 0.0;
+      let wins = 0;
+      let grossGains = 0.0;
+      let grossLosses = 0.0;
+
+      allClosed.forEach(t => {
+        const pnl = parseFloat(t.realized_pnl ?? t.pnl_usd ?? 0);
+        totalPnl += pnl;
+        if (pnl >= 0) {
+          wins++;
+          grossGains += pnl;
+        } else {
+          grossLosses += Math.abs(pnl);
+        }
+      });
+
+      const totalClosed = allClosed.length;
+      const winRate = totalClosed > 0 ? Math.round((wins / totalClosed) * 100) : 0;
+      const profitFactor = grossLosses > 0 ? (grossGains / grossLosses).toFixed(2) : (grossGains > 0 ? "∞" : "0.00");
+
+      const pnlEl = document.getElementById('histTotalPnl');
+      pnlEl.textContent = (totalPnl >= 0 ? '+$' : '-$') + Math.abs(totalPnl).toFixed(2);
+      pnlEl.style.color = totalPnl >= 0 ? 'var(--success)' : 'var(--danger)';
+
+      document.getElementById('histWinRate').textContent = `${winRate}%`;
+      document.getElementById('histTotalClosed').textContent = totalClosed;
+      document.getElementById('histProfitFactor').textContent = profitFactor;
+    }
+
+    function applyHistoryFilters() {
+      const search = (document.getElementById('historySearchInput').value || '').toUpperCase().trim();
+      const outcome = document.getElementById('historyOutcomeFilter').value;
+
+      const filtered = cachedArchivedTrades.filter(t => {
+        const matchesTicker = !search || (t.ticker && t.ticker.toUpperCase().includes(search));
+        const pnl = parseFloat(t.realized_pnl ?? t.pnl_usd ?? 0);
+        let matchesOutcome = true;
+        if (outcome === 'PROFIT') matchesOutcome = pnl >= 0;
+        if (outcome === 'STOP') matchesOutcome = pnl < 0;
+        return matchesTicker && matchesOutcome;
+      });
+
+      renderHistoryTable(filtered);
+    }
+
+    function renderHistoryTable(trades) {
+      const tbody = document.getElementById('historyTableBody');
+      tbody.innerHTML = '';
+
+      if (!trades || trades.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="9" style="text-align: center; color: var(--text-muted);">No archived trades match the filter criteria.</td></tr>';
+        return;
+      }
+
+      trades.forEach(t => {
+        const pnl = parseFloat(t.realized_pnl ?? t.pnl_usd ?? 0);
+        const isWin = pnl >= 0;
+        tbody.innerHTML += `<tr>
+          <td><code style="color:var(--text-muted); font-size:0.75rem;">${t.trade_id || '--'}</code></td>
+          <td>${t.exit_timestamp || t.timestamp}</td>
+          <td style="font-weight:700; color:var(--primary);">${t.ticker}</td>
+          <td>${t.action}</td>
+          <td>$${t.entry_price}</td>
+          <td>$${t.exit_price || '--'}</td>
+          <td style="font-weight:700; color:${isWin ? 'var(--success)' : 'var(--danger)'};">${isWin ? '+$' : '-$'}${Math.abs(pnl).toFixed(2)}</td>
+          <td><span class="badge-pill ${isWin ? 'badge-pass' : 'badge-kill'}">${t.exit_reason || 'CLOSED'}</span></td>
+          <td style="font-size:0.78rem; color:var(--text-muted); max-width:240px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;" title="${t.top_reasons || t.notes || ''}">${t.top_reasons || t.notes || '--'}</td>
+        </tr>`;
+      });
+    }
+
+    function exportJournalCsv() {
+      window.location.href = '/api/trading/journal/download';
+    }
+
+    async function fetchSchedulerStatus() {
+      try {
+        const res = await fetch('/api/trading/scheduler/status');
+        const data = await res.json();
+        const btn = document.getElementById('toggleSchedulerBtn');
+        const banner = document.getElementById('schedulerStatusBanner');
+        const selectInterval = document.getElementById('intervalSelect');
+        const selectUniverse = document.getElementById('universeSelect');
+
+        if (data.is_running) {
+          btn.textContent = 'Stop Auto-Scan';
+          btn.style.backgroundColor = 'var(--danger)';
+          btn.style.color = '#fff';
+          selectInterval.value = data.interval_hours;
+          if (data.universe) selectUniverse.value = data.universe;
+          banner.innerHTML = `Auto-Scheduler: <strong style="color:var(--success);">Active (${data.universe} every ${data.interval_hours}h)</strong> | Next Run: <code>${data.next_run ? data.next_run.split('.')[0] : 'Calculating...'}</code>`;
+        } else {
+          btn.textContent = 'Start Auto-Scan';
+          btn.style.backgroundColor = 'var(--primary)';
+          btn.style.color = '#0f172a';
+          banner.innerHTML = `Auto-Scheduler: <strong style="color:var(--text-muted);">Inactive</strong>`;
+        }
+      } catch (err) {}
+    }
+
+    async function toggleAutoScanner() {
+      const btn = document.getElementById('toggleSchedulerBtn');
+      const isCurrentlyRunning = btn.textContent.includes('Stop');
+      const interval = parseInt(document.getElementById('intervalSelect').value, 10);
+      const universe = document.getElementById('universeSelect').value;
+
+      if (!isCurrentlyRunning) {
+        await fetch('/api/trading/scheduler/start', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ interval_hours: interval, universe: universe })
+        });
+      } else {
+        await fetch('/api/trading/scheduler/stop', { method: 'POST' });
+      }
+      fetchSchedulerStatus();
+    }
+
+    initTradingDesk();
+  </script>
+</body>
+</html>

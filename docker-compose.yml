@@ -1,0 +1,21 @@
+services:
+  trading-desk:
+    build: .
+    container_name: trading_desk
+    restart: unless-stopped
+    ports:
+      - "5085:5085"
+    env_file:
+      - .env
+    volumes:
+      - ./app.py:/app/app.py
+      - ./tools:/app/tools
+      - ./templates:/app/templates
+      - ./hub_settings.json:/app/hub_settings.json
+      - ./journal.csv:/app/journal.csv
+      - ./watchlist.csv:/app/watchlist.csv
+      - ./rulebook.json:/app/rulebook.json
+      - ./.env:/app/.env
+    environment:
+      - PYTHONUNBUFFERED=1
+      - TZ=Europe/London
