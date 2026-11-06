@@ -3,6 +3,7 @@ from app.core.state import system_state
 from app.config import settings
 from app.services.buffer import buffer_manager
 from app.services.stream import send_ntfy_alert
+from app.services.gemini_agent import evaluate_intraday_opportunity
 from datetime import datetime
 
 router = APIRouter()
@@ -60,6 +61,42 @@ async def get_ticker_signals(ticker: str):
         "ticker": ticker_upper,
         "timestamp": datetime.utcnow().isoformat(),
         "analysis": analysis
+    }
+
+
+@router.post("/evaluate/{ticker}")
+async def evaluate_ticker_now(ticker: str):
+    """Manually triggers an immediate Gemini evaluation regardless of session state."""
+    ticker_upper = ticker.upper()
+    analysis = system_state.technical_analysis.get(ticker_upper)
+    if not analysis:
+        raise HTTPException(status_code=404, detail=f"No technical analysis available for {ticker_upper}. Initialize buffer first.")
+
+    decision = await evaluate_intraday_opportunity(
+        ticker=ticker_upper,
+        session_phase=system_state.session_phase,
+        technical_analysis=analysis
+    )
+    system_state.agent_evaluations[ticker_upper] = {
+        "timestamp": datetime.utcnow().isoformat(),
+        "decision": decision
+    }
+    return {
+        "ticker": ticker_upper,
+        "session_phase": system_state.session_phase,
+        "decision": decision
+    }
+
+
+@router.get("/agent/{ticker}")
+async def get_agent_evaluation(ticker: str):
+    ticker_upper = ticker.upper()
+    evaluation = system_state.agent_evaluations.get(ticker_upper)
+    if not evaluation:
+        raise HTTPException(status_code=404, detail=f"No Gemini evaluation recorded for {ticker_upper}")
+    return {
+        "ticker": ticker_upper,
+        "evaluation": evaluation
     }
 
 

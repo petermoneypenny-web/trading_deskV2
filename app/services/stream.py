@@ -9,6 +9,7 @@ import pandas as pd
 from app.core.state import system_state
 from app.services.buffer import buffer_manager
 from app.services.indicators import evaluate_intraday_technical_snapshot
+from app.services.gemini_agent import evaluate_intraday_opportunity
 from app.config import settings
 
 logger = logging.getLogger("trading_desk_v2.stream")
@@ -37,18 +38,13 @@ def get_current_session_phase() -> str:
 
 
 def _fetch_ticker_intraday(ticker: str) -> pd.DataFrame:
-    """
-    Pulls intraday bars. Falls back to period='5d' if the market is closed
-    so buffers are never empty during testing or weekend preparation.
-    """
+    """Pulls intraday bars with 5d fallback for off-hours testing."""
     t = yf.Ticker(ticker)
     df = t.history(period="1d", interval="1m", prepost=True)
-    
     if df is None or df.empty:
         df = t.history(period="5d", interval="1m", prepost=True)
         if df is not None and not df.empty:
             df = df.tail(120)
-
     return df
 
 
@@ -70,7 +66,7 @@ async def send_ntfy_alert(title: str, message: str, priority: int = 3):
 
 
 async def sync_market_data():
-    """Fetches intraday bars, updates buffers, and calculates technical setups."""
+    """Fetches intraday bars, updates buffers, calculates technical setups, and runs agent evaluations."""
     for ticker in system_state.active_tickers:
         try:
             df = await asyncio.to_thread(_fetch_ticker_intraday, ticker)
@@ -85,11 +81,29 @@ async def sync_market_data():
                         "volume": last_bar["volume"],
                         "timestamp": last_bar["timestamp"]
                     }
-                
-                # Compute indicators on the refreshed rolling buffer
+
+                # Evaluate indicators
                 buffer_df = buffer_manager.get_dataframe(ticker, interval="1m")
                 analysis = evaluate_intraday_technical_snapshot(buffer_df)
                 system_state.technical_analysis[ticker] = analysis
+
+                # Trigger Gemini evaluation if session is active and technical bias exists
+                if system_state.is_active and analysis.get("signal") not in ("NEUTRAL", None):
+                    decision = await evaluate_intraday_opportunity(
+                        ticker=ticker,
+                        session_phase=system_state.session_phase,
+                        technical_analysis=analysis
+                    )
+                    system_state.agent_evaluations[ticker] = {
+                        "timestamp": datetime.utcnow().isoformat(),
+                        "decision": decision
+                    }
+                    if decision.get("action") in ("BUY", "SELL") and decision.get("confidence", 0) >= 70:
+                        await send_ntfy_alert(
+                            title=f"Gemini Signal: {decision['action']} {ticker}",
+                            message=f"Price: {decision['entry_price']} | SL: {decision['stop_loss']} | TP: {decision['take_profit']}\nReason: {decision['reasoning']}",
+                            priority=4
+                        )
 
             system_state.last_fetch_error = None
         except Exception as e:
