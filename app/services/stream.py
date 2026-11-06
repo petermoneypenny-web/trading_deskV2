@@ -8,6 +8,7 @@ import pandas as pd
 
 from app.core.state import system_state
 from app.services.buffer import buffer_manager
+from app.services.indicators import evaluate_intraday_technical_snapshot
 from app.config import settings
 
 logger = logging.getLogger("trading_desk_v2.stream")
@@ -41,16 +42,11 @@ def _fetch_ticker_intraday(ticker: str) -> pd.DataFrame:
     so buffers are never empty during testing or weekend preparation.
     """
     t = yf.Ticker(ticker)
-    
-    # Try fetching current day including extended hours
     df = t.history(period="1d", interval="1m", prepost=True)
     
-    # If market is closed or no bars today, pull recent days and slice the latest session
     if df is None or df.empty:
-        logger.info(f"No 1d intraday bars for {ticker}. Fetching recent multi-day history.")
         df = t.history(period="5d", interval="1m", prepost=True)
         if df is not None and not df.empty:
-            # Retain the most recent session's bars up to the buffer limit
             df = df.tail(120)
 
     return df
@@ -74,7 +70,7 @@ async def send_ntfy_alert(title: str, message: str, priority: int = 3):
 
 
 async def sync_market_data():
-    """Fetches intraday bars for all active tickers without blocking the event loop."""
+    """Fetches intraday bars, updates buffers, and calculates technical setups."""
     for ticker in system_state.active_tickers:
         try:
             df = await asyncio.to_thread(_fetch_ticker_intraday, ticker)
@@ -89,9 +85,15 @@ async def sync_market_data():
                         "volume": last_bar["volume"],
                         "timestamp": last_bar["timestamp"]
                     }
+                
+                # Compute indicators on the refreshed rolling buffer
+                buffer_df = buffer_manager.get_dataframe(ticker, interval="1m")
+                analysis = evaluate_intraday_technical_snapshot(buffer_df)
+                system_state.technical_analysis[ticker] = analysis
+
             system_state.last_fetch_error = None
         except Exception as e:
-            error_msg = f"Failed to ingest data for {ticker}: {e}"
+            error_msg = f"Failed to ingest/evaluate {ticker}: {e}"
             logger.warning(error_msg)
             system_state.last_fetch_error = error_msg
 
@@ -99,8 +101,6 @@ async def sync_market_data():
 async def run_intraday_tick_loop():
     """Background asynchronous loop for market monitoring and buffer updates."""
     logger.info("Day-Trading Intraday Loop initialized.")
-    
-    # Warm up buffer once on startup regardless of session status
     await sync_market_data()
 
     while True:
@@ -110,7 +110,7 @@ async def run_intraday_tick_loop():
 
             if system_state.is_active:
                 await sync_market_data()
-                logger.debug(f"Market tick synced at {system_state.last_loop_timestamp.isoformat()}")
+                logger.debug(f"Tick & indicator analysis updated at {system_state.last_loop_timestamp.isoformat()}")
 
             sleep_duration = 10 if system_state.is_active else 60
             await asyncio.sleep(sleep_duration)

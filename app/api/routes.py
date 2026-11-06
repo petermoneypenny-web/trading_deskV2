@@ -40,14 +40,26 @@ async def get_ticker_buffer(ticker: str, interval: str = Query("1m", regex="^(1m
     df = buffer_manager.get_dataframe(ticker_upper, interval=interval)
     if df.empty:
         raise HTTPException(status_code=404, detail=f"No buffer data found for {ticker_upper}")
-    
-    # Return recent 30 bars formatted as records
+
     records = df.tail(30).reset_index().to_dict(orient="records")
     return {
         "ticker": ticker_upper,
         "interval": interval,
         "bars_count": len(df),
         "recent_bars": records
+    }
+
+
+@router.get("/signals/{ticker}")
+async def get_ticker_signals(ticker: str):
+    ticker_upper = ticker.upper()
+    analysis = system_state.technical_analysis.get(ticker_upper)
+    if not analysis:
+        raise HTTPException(status_code=404, detail=f"No technical analysis available for {ticker_upper}")
+    return {
+        "ticker": ticker_upper,
+        "timestamp": datetime.utcnow().isoformat(),
+        "analysis": analysis
     }
 
 
