@@ -167,12 +167,23 @@ async def get_trade_history(limit: int = 50):
 @router.delete("/trades/history")
 async def clear_trade_history():
     db_path = settings.DATABASE_URL.replace("sqlite:///", "")
-    with sqlite3.connect(db_path) as conn:
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM trades")
-        cursor.execute("VACUUM")
-        conn.commit()
-    return {"status": "cleared", "message": "Closed trade history has been wiped."}
+    try:
+        conn = sqlite3.connect(db_path)
+        with conn:
+            conn.execute("DELETE FROM trades")
+        
+        # VACUUM requires autocommit mode (no active transaction)
+        conn.isolation_level = None
+        conn.execute("VACUUM")
+        conn.close()
+
+        # Reset session P&L counters in memory
+        system_state.daily_realized_pnl = 0.0
+        system_state.daily_unrealized_pnl = 0.0
+
+        return {"status": "cleared", "message": "Closed trade history wiped and daily PnL reset."}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to clear trade history: {str(e)}")
 
 
 @router.get("/buffer/{ticker}")
