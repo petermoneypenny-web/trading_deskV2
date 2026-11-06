@@ -7,7 +7,7 @@ from app.config import settings
 
 logger = logging.getLogger("trading_desk_v2.gemini")
 
-GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
+BASE_GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models"
 
 SYSTEM_INSTRUCTION = """You are an institutional intraday momentum trader and execution agent.
 Your objective is to evaluate real-time technical indicators, VWAP positioning, Opening Range Breakout (ORB) levels, and momentum metrics to issue precise day-trading decisions.
@@ -63,7 +63,7 @@ async def evaluate_intraday_opportunity(
     technical_analysis: Dict[str, Any]
 ) -> Dict[str, Any]:
     """
-    Asynchronously queries Gemini 2.5 Flash to evaluate an intraday setup.
+    Asynchronously queries Gemini Flash to evaluate an intraday setup.
     """
     if not settings.GEMINI_API_KEY:
         logger.warning("GEMINI_API_KEY is not configured. Defaulting to HOLD.")
@@ -92,7 +92,6 @@ async def evaluate_intraday_opportunity(
             "reasoning": "Missing price data for technical evaluation."
         }
 
-    # Construct concise prompt payload
     user_prompt = f"""Evaluate day trading opportunity for ticker: {ticker}
 Market Session Phase: {session_phase}
 Current Indicator Snapshot:
@@ -121,13 +120,13 @@ Determine action (BUY, SELL, or HOLD), dynamic stop loss, and target profit. Out
             "parts": [{"text": SYSTEM_INSTRUCTION}]
         },
         "generationConfig": {
-            "temperature": 0.1,  # Low temperature for deterministic financial logic
+            "temperature": 0.1,
             "response_mime_type": "application/json",
             "response_schema": DECISION_SCHEMA
         }
     }
 
-    url = f"{GEMINI_API_URL}?key={settings.GEMINI_API_KEY}"
+    url = f"{BASE_GEMINI_URL}/{settings.GEMINI_MODEL}:generateContent?key={settings.GEMINI_API_KEY}"
 
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
