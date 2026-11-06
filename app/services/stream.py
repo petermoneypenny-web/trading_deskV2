@@ -1,19 +1,17 @@
+import os
 import asyncio
 import logging
 from datetime import datetime
 from zoneinfo import ZoneInfo
-from typing import Dict
+from typing import Dict, List
 import yfinance as yf
 import pandas as pd
-import os
 
 # Disable yfinance internal SQLite disk-cache locking inside container
 import yfinance.cache as yf_cache
 try:
-    # Point tz cache to a volatile RAM/temp path
     os.makedirs("/tmp/py-yfinance", exist_ok=True)
     yf.set_tz_cache_location("/tmp/py-yfinance")
-    # Disable persistent SQLite ticker/cookie caching
     if hasattr(yf_cache, "enable_cache"):
         yf_cache.enable_cache(False)
 except Exception:
@@ -57,7 +55,7 @@ def get_current_session_phase() -> str:
         return "CLOSED"
 
 
-def _fetch_batched_intraday(tickers: list[str]) -> Dict[str, pd.DataFrame]:
+def _fetch_batched_intraday(tickers: List[str]) -> Dict[str, pd.DataFrame]:
     """
     Downloads 1-minute bars for all watchlist tickers in a single HTTP request.
     """
@@ -66,7 +64,6 @@ def _fetch_batched_intraday(tickers: list[str]) -> Dict[str, pd.DataFrame]:
 
     ticker_str = " ".join(tickers)
     
-    # Try fetching current day 1m bars with extended hours, disabling multi-threading lock
     df = yf.download(
         tickers=ticker_str,
         period="1d",
@@ -77,7 +74,6 @@ def _fetch_batched_intraday(tickers: list[str]) -> Dict[str, pd.DataFrame]:
         group_by="column"
     )
 
-    # Off-market / pre-session fallback: pull 5d to ensure populated buffer
     if df is None or df.empty:
         logger.info(f"Batched 1d download empty for [{ticker_str}]. Falling back to 5d history.")
         df = yf.download(
@@ -120,6 +116,32 @@ def _fetch_batched_intraday(tickers: list[str]) -> Dict[str, pd.DataFrame]:
     return result
 
 
+async def fetch_single_ticker_data(ticker: str):
+    """Fetches and populates buffer/indicators for a single ticker on demand."""
+    try:
+        data_map = await asyncio.to_thread(_fetch_batched_intraday, [ticker])
+        df = data_map.get(ticker)
+        if df is not None and not df.empty:
+            buffer_manager.load_initial_history(ticker, df, interval="1m")
+            last_bar = buffer_manager.get_latest_bar(ticker, interval="1m")
+            if last_bar:
+                system_state.latest_quotes[ticker] = {
+                    "price": last_bar["close"],
+                    "high": last_bar["high"],
+                    "low": last_bar["low"],
+                    "volume": last_bar["volume"],
+                    "timestamp": last_bar["timestamp"]
+                }
+            buffer_df = buffer_manager.get_dataframe(ticker, interval="1m")
+            analysis = evaluate_intraday_technical_snapshot(buffer_df)
+            system_state.technical_analysis[ticker] = analysis
+            logger.info(f"Successfully initialized buffer and indicators for new ticker {ticker}")
+            return True
+    except Exception as e:
+        logger.error(f"Failed to fetch initial data for {ticker}: {e}")
+    return False
+
+
 async def sync_market_data():
     """Fetches intraday bars in a single batched call, updates buffers, evaluates setups, and manages execution."""
     active_tickers = list(system_state.active_tickers)
@@ -127,7 +149,6 @@ async def sync_market_data():
         return
 
     try:
-        # Offload synchronous batched download to dedicated worker thread
         data_map = await asyncio.to_thread(_fetch_batched_intraday, active_tickers)
 
         for ticker in active_tickers:
@@ -144,7 +165,6 @@ async def sync_market_data():
                         "timestamp": last_bar["timestamp"]
                     }
 
-                # Calculate indicators on the refreshed rolling buffer
                 buffer_df = buffer_manager.get_dataframe(ticker, interval="1m")
                 analysis = evaluate_intraday_technical_snapshot(buffer_df)
                 system_state.technical_analysis[ticker] = analysis
@@ -181,10 +201,8 @@ async def sync_market_data():
         logger.warning(error_msg)
         system_state.last_fetch_error = error_msg
 
-    # Update stop losses and unrealized PnL on every cycle
     await update_open_positions_and_risk(system_state.latest_quotes)
 
-    # Mandatory EOD Liquidation: Flatten all positions 15 minutes before market close
     if system_state.session_phase == "RTH_EOD_CLOSING" and system_state.open_positions:
         logger.info("RTH_EOD_CLOSING reached. Flattening all intraday positions.")
         await liquidate_all_positions(reason="RTH_EOD_AUTO_CLOSE")
@@ -195,7 +213,7 @@ async def run_intraday_tick_loop():
     logger.info("Day-Trading Intraday Loop initialized.")
     init_db()
     
-    # Warm up buffer once on startup
+    # Initial batch fetch on startup
     await sync_market_data()
 
     while True:
@@ -203,11 +221,10 @@ async def run_intraday_tick_loop():
             system_state.session_phase = get_current_session_phase()
             system_state.last_loop_timestamp = datetime.utcnow()
 
-            if system_state.is_active:
-                await sync_market_data()
-                logger.debug(f"Tick sync completed at {system_state.last_loop_timestamp.isoformat()}")
+            # Always sync market data during loop; frequency adjusts if active vs paused
+            await sync_market_data()
 
-            sleep_duration = 10 if system_state.is_active else 60
+            sleep_duration = 10 if system_state.is_active else 30
             await asyncio.sleep(sleep_duration)
         except asyncio.CancelledError:
             logger.info("Intraday tick loop cancellation received.")

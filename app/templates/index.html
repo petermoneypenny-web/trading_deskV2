@@ -196,7 +196,10 @@
   </div>
 
   <div class="card">
-    <h3>Closed Trade Journal (SQLite)</h3>
+    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.8rem;">
+      <h3 style="margin: 0;">Closed Trade Journal (SQLite)</h3>
+      <button class="btn btn-danger" style="font-size: 0.75rem; padding: 0.25rem 0.6rem;" onclick="clearTrades()">Clear Log</button>
+    </div>
     <table>
       <thead>
         <tr>
@@ -327,6 +330,22 @@
         }).join('');
       } catch (e) {
         console.error("Trades poll failed:", e);
+      }
+    }
+
+    async function clearTrades() {
+      if (confirm("Are you sure you want to clear the entire closed trade history?")) {
+        try {
+          const res = await fetch('/api/trades/history', { method: 'DELETE' });
+          if (res.ok) {
+            fetchTrades();
+          } else {
+            const err = await res.json();
+            alert(err.detail || "Failed to clear trade history");
+          }
+        } catch (e) {
+          console.error("Failed to clear trade history:", e);
+        }
       }
     }
 

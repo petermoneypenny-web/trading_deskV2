@@ -1,3 +1,4 @@
+import asyncio
 import sqlite3
 from fastapi import APIRouter, Query, HTTPException
 from pydantic import BaseModel
@@ -8,50 +9,12 @@ from app.core.state import system_state
 from app.config import settings
 from app.services.buffer import buffer_manager
 from app.services.alerts import send_ntfy_alert
+from app.services.stream import fetch_single_ticker_data
 from app.services.gemini_agent import evaluate_intraday_opportunity
 from app.services.risk_engine import open_position, close_position, liquidate_all_positions
-from app.services.scheduler import scheduler
-
 
 router = APIRouter()
 
-class TickerRequest(BaseModel):
-    ticker: str
-
-
-@router.get("/watchlist")
-async def get_watchlist():
-    return {
-        "count": len(system_state.active_tickers),
-        "tickers": system_state.active_tickers
-    }
-
-
-@router.post("/watchlist")
-async def add_watchlist_ticker(payload: TickerRequest):
-    ticker = payload.ticker.strip().upper()
-    if not ticker:
-        raise HTTPException(status_code=400, detail="Invalid ticker symbol.")
-    if ticker in system_state.active_tickers:
-        return {"status": "already_present", "tickers": system_state.active_tickers}
-    
-    system_state.active_tickers.append(ticker)
-    return {"status": "added", "ticker": ticker, "tickers": system_state.active_tickers}
-
-
-@router.delete("/watchlist/{ticker}")
-async def remove_watchlist_ticker(ticker: str):
-    ticker_upper = ticker.strip().upper()
-    if ticker_upper not in system_state.active_tickers:
-        raise HTTPException(status_code=404, detail=f"{ticker_upper} not found in active watchlist.")
-    
-    system_state.active_tickers.remove(ticker_upper)
-    # Clean up associated telemetry state
-    system_state.latest_quotes.pop(ticker_upper, None)
-    system_state.technical_analysis.pop(ticker_upper, None)
-    system_state.agent_evaluations.pop(ticker_upper, None)
-    
-    return {"status": "removed", "ticker": ticker_upper, "tickers": system_state.active_tickers}
 
 class OrderRequest(BaseModel):
     ticker: str
@@ -60,6 +23,10 @@ class OrderRequest(BaseModel):
     stop_loss: float
     take_profit: float
     reasoning: Optional[str] = "Manual order entry via API"
+
+
+class TickerRequest(BaseModel):
+    ticker: str
 
 
 @router.get("/health")
@@ -72,17 +39,6 @@ async def health_check():
         "timestamp": datetime.utcnow().isoformat()
     }
 
-@router.get("/scheduler/jobs")
-async def get_scheduled_jobs():
-    jobs = []
-    for job in scheduler.get_jobs():
-        jobs.append({
-            "id": job.id,
-            "name": job.name,
-            "next_run_time": job.next_run_time.isoformat() if job.next_run_time else None,
-            "trigger": str(job.trigger)
-        })
-    return {"scheduler_running": scheduler.running, "jobs": jobs}
 
 @router.get("/status")
 async def get_system_status():
@@ -99,6 +55,43 @@ async def get_system_status():
         "last_loop_timestamp": system_state.last_loop_timestamp.isoformat() if system_state.last_loop_timestamp else None,
         "last_fetch_error": system_state.last_fetch_error
     }
+
+
+@router.get("/watchlist")
+async def get_watchlist():
+    return {
+        "count": len(system_state.active_tickers),
+        "tickers": system_state.active_tickers
+    }
+
+
+@router.post("/watchlist")
+async def add_watchlist_ticker(payload: TickerRequest):
+    ticker = payload.ticker.strip().upper()
+    if not ticker:
+        raise HTTPException(status_code=400, detail="Invalid ticker symbol.")
+    
+    if ticker not in system_state.active_tickers:
+        system_state.active_tickers.append(ticker)
+
+    # Immediately fetch initial candle buffer asynchronously so signals are ready right away
+    asyncio.create_task(fetch_single_ticker_data(ticker))
+
+    return {"status": "added", "ticker": ticker, "tickers": system_state.active_tickers}
+
+
+@router.delete("/watchlist/{ticker}")
+async def remove_watchlist_ticker(ticker: str):
+    ticker_upper = ticker.strip().upper()
+    if ticker_upper not in system_state.active_tickers:
+        raise HTTPException(status_code=404, detail=f"{ticker_upper} not found in active watchlist.")
+    
+    system_state.active_tickers.remove(ticker_upper)
+    system_state.latest_quotes.pop(ticker_upper, None)
+    system_state.technical_analysis.pop(ticker_upper, None)
+    system_state.agent_evaluations.pop(ticker_upper, None)
+    
+    return {"status": "removed", "ticker": ticker_upper, "tickers": system_state.active_tickers}
 
 
 @router.get("/positions")
@@ -157,6 +150,17 @@ async def get_trade_history(limit: int = 50):
     return {"count": len(rows), "trades": rows}
 
 
+@router.delete("/trades/history")
+async def clear_trade_history():
+    db_path = settings.DATABASE_URL.replace("sqlite:///", "")
+    with sqlite3.connect(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM trades")
+        cursor.execute("VACUUM")
+        conn.commit()
+    return {"status": "cleared", "message": "Closed trade history has been wiped."}
+
+
 @router.get("/buffer/{ticker}")
 async def get_ticker_buffer(ticker: str, interval: str = Query("1m", pattern="^(1m|5m)$")):
     ticker_upper = ticker.upper()
@@ -190,8 +194,14 @@ async def get_ticker_signals(ticker: str):
 async def evaluate_ticker_now(ticker: str):
     ticker_upper = ticker.upper()
     analysis = system_state.technical_analysis.get(ticker_upper)
+    
+    # If buffer not yet ready, attempt on-demand fetch first
     if not analysis:
-        raise HTTPException(status_code=404, detail=f"No technical analysis available for {ticker_upper}.")
+        await fetch_single_ticker_data(ticker_upper)
+        analysis = system_state.technical_analysis.get(ticker_upper)
+
+    if not analysis:
+        raise HTTPException(status_code=404, detail=f"No price or indicator data available for {ticker_upper}. Please wait a few seconds and retry.")
 
     decision = await evaluate_intraday_opportunity(
         ticker=ticker_upper,
