@@ -7,9 +7,8 @@ from app.config import settings
 
 logger = logging.getLogger("trading_desk_v2.gemini")
 
-# Confirmed endpoint and model from your account's supported models
 BASE_GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models"
-MODEL_NAME = getattr(settings, "GEMINI_MODEL", "gemini-2.5-flash")
+MODEL_NAME = getattr(settings, "GEMINI_MODEL", "gemini-flash-latest")
 
 SYSTEM_INSTRUCTION = """You are an institutional intraday momentum trader and execution agent.
 Your objective is to evaluate real-time technical indicators, VWAP positioning, Opening Range Breakout (ORB) levels, and momentum metrics to issue precise day-trading decisions.
@@ -30,7 +29,7 @@ async def evaluate_intraday_opportunity(
     technical_analysis: Dict[str, Any]
 ) -> Dict[str, Any]:
     """
-    Asynchronously queries Gemini 2.5 Flash on v1beta to evaluate an intraday setup.
+    Asynchronously queries the active Gemini Flash model to evaluate an intraday setup.
     """
     if not settings.GEMINI_API_KEY:
         logger.warning("GEMINI_API_KEY is not configured. Defaulting to HOLD.")
@@ -74,7 +73,7 @@ Current Indicator Snapshot:
 - Algorithmic Signal: {signal}
 - Bias Score: {technical_analysis.get('bias_score', 0)}
 
-Required JSON format:
+Required JSON schema:
 {{
   "action": "BUY" | "SELL" | "HOLD",
   "confidence": 75,
@@ -82,7 +81,7 @@ Required JSON format:
   "stop_loss": 732.50,
   "take_profit": 737.50,
   "risk_reward_ratio": 1.85,
-  "reasoning": "Brief explanation"
+  "reasoning": "1 to 2 sentences explaining key conviction"
 }}
 Return ONLY raw JSON."""
 
@@ -94,7 +93,6 @@ Return ONLY raw JSON."""
             }
         ],
         "generationConfig": {
-            "temperature": 0.1,
             "responseMimeType": "application/json"
         }
     }
@@ -120,7 +118,7 @@ Return ONLY raw JSON."""
             result_data = response.json()
             raw_text = result_data["candidates"][0]["content"]["parts"][0]["text"].strip()
             
-            # Clean possible markdown wrapping if returned
+            # Strip markdown formatting if returned
             if raw_text.startswith("```json"):
                 raw_text = raw_text[7:]
             if raw_text.startswith("```"):
