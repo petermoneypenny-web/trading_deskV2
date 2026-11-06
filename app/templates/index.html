@@ -43,6 +43,7 @@
     }
     .badge-active { background: rgba(46,160,67,0.2); color: var(--green); border: 1px solid var(--green); }
     .badge-paused { background: rgba(210,153,34,0.2); color: var(--yellow); border: 1px solid var(--yellow); }
+    .badge-danger { background: rgba(248,81,73,0.2); color: var(--red); border: 1px solid var(--red); }
     .btn {
       padding: 0.4rem 0.8rem;
       border-radius: 4px;
@@ -71,6 +72,14 @@
       margin-bottom: 0.5rem;
       text-transform: uppercase;
     }
+    .card-header-flex {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 0.8rem;
+      flex-wrap: wrap;
+      gap: 0.5rem;
+    }
     .card .val { font-size: 1.4rem; font-weight: 700; }
     .positive { color: var(--green); }
     .negative { color: var(--red); }
@@ -82,6 +91,26 @@
     }
     th { color: var(--text-muted); font-size: 0.75rem; text-transform: uppercase; }
     .actions { display: flex; gap: 0.5rem; }
+    .watchlist-form {
+      display: flex;
+      gap: 0.5rem;
+      align-items: center;
+    }
+    .watchlist-input {
+      background: #0d1117;
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 0.35rem 0.6rem;
+      border-radius: 4px;
+      font-family: inherit;
+      font-size: 0.8rem;
+      text-transform: uppercase;
+      width: 140px;
+    }
+    .watchlist-input:focus {
+      outline: none;
+      border-color: var(--blue);
+    }
   </style>
 </head>
 <body>
@@ -117,7 +146,13 @@
   </div>
 
   <div class="card" style="margin-bottom: 1.5rem;">
-    <h3>Active Market Ticker Radar (1m Candles)</h3>
+    <div class="card-header-flex">
+      <h3 style="margin: 0;">Active Market Ticker Radar (1m Candles)</h3>
+      <div class="watchlist-form">
+        <input type="text" id="new-ticker-input" class="watchlist-input" placeholder="e.g. TSLA" onkeydown="if(event.key==='Enter') addTicker()">
+        <button class="btn btn-primary" onclick="addTicker()">+ Add Ticker</button>
+      </div>
+    </div>
     <table>
       <thead>
         <tr>
@@ -129,10 +164,11 @@
           <th>ATR (14)</th>
           <th>Signal</th>
           <th>Action</th>
+          <th>Remove</th>
         </tr>
       </thead>
       <tbody id="ticker-tbody">
-        <tr><td colspan="8" style="color:var(--text-muted)">Loading intraday market feed...</td></tr>
+        <tr><td colspan="9" style="color:var(--text-muted)">Loading intraday market feed...</td></tr>
       </tbody>
     </table>
   </div>
@@ -252,10 +288,13 @@
               <td>${m.rsi_14 || '--'}</td>
               <td>${m.atr_14 || '--'}</td>
               <td><span class="badge" style="background:#21262d; border:1px solid var(--border);">${sigData.signal || 'NEUTRAL'}</span></td>
-              <td><button class="btn btn-primary" onclick="evaluateTicker('${t}')">Gemini Scan</button></td>
+              <td><button class="btn btn-primary" onclick="evaluateTicker('${t}')">Scan</button></td>
+              <td><button class="btn btn-danger" style="padding: 0.2rem 0.55rem; font-size: 0.75rem;" onclick="removeTicker('${t}')">×</button></td>
             </tr>`;
           }));
           tickTbody.innerHTML = rows.join('');
+        } else {
+          tickTbody.innerHTML = '<tr><td colspan="9" style="color:var(--text-muted)">Watchlist is empty. Add a ticker above.</td></tr>';
         }
 
       } catch (err) {
@@ -317,6 +356,45 @@
       const data = await res.json();
       const d = data.decision;
       alert(`[${ticker}] Action: ${d.action} (Confidence: ${d.confidence}%)\nTarget: $${d.take_profit} | Stop: $${d.stop_loss}\n\nThesis: ${d.reasoning}`);
+    }
+
+    async function addTicker() {
+      const input = document.getElementById('new-ticker-input');
+      const ticker = input.value.trim().toUpperCase();
+      if (!ticker) return;
+
+      try {
+        const res = await fetch('/api/watchlist', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ticker: ticker })
+        });
+        if (res.ok) {
+          input.value = '';
+          fetchStatus();
+        } else {
+          const err = await res.json();
+          alert(err.detail || "Failed to add ticker");
+        }
+      } catch (e) {
+        console.error("Failed to add ticker:", e);
+      }
+    }
+
+    async function removeTicker(ticker) {
+      if (confirm(`Remove ${ticker} from watchlist?`)) {
+        try {
+          const res = await fetch(`/api/watchlist/${ticker}`, { method: 'DELETE' });
+          if (res.ok) {
+            fetchStatus();
+          } else {
+            const err = await res.json();
+            alert(err.detail || "Failed to remove ticker");
+          }
+        } catch (e) {
+          console.error("Failed to remove ticker:", e);
+        }
+      }
     }
 
     // Auto-refresh cadence

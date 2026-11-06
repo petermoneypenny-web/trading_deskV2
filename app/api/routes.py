@@ -15,6 +15,43 @@ from app.services.scheduler import scheduler
 
 router = APIRouter()
 
+class TickerRequest(BaseModel):
+    ticker: str
+
+
+@router.get("/watchlist")
+async def get_watchlist():
+    return {
+        "count": len(system_state.active_tickers),
+        "tickers": system_state.active_tickers
+    }
+
+
+@router.post("/watchlist")
+async def add_watchlist_ticker(payload: TickerRequest):
+    ticker = payload.ticker.strip().upper()
+    if not ticker:
+        raise HTTPException(status_code=400, detail="Invalid ticker symbol.")
+    if ticker in system_state.active_tickers:
+        return {"status": "already_present", "tickers": system_state.active_tickers}
+    
+    system_state.active_tickers.append(ticker)
+    return {"status": "added", "ticker": ticker, "tickers": system_state.active_tickers}
+
+
+@router.delete("/watchlist/{ticker}")
+async def remove_watchlist_ticker(ticker: str):
+    ticker_upper = ticker.strip().upper()
+    if ticker_upper not in system_state.active_tickers:
+        raise HTTPException(status_code=404, detail=f"{ticker_upper} not found in active watchlist.")
+    
+    system_state.active_tickers.remove(ticker_upper)
+    # Clean up associated telemetry state
+    system_state.latest_quotes.pop(ticker_upper, None)
+    system_state.technical_analysis.pop(ticker_upper, None)
+    system_state.agent_evaluations.pop(ticker_upper, None)
+    
+    return {"status": "removed", "ticker": ticker_upper, "tickers": system_state.active_tickers}
 
 class OrderRequest(BaseModel):
     ticker: str
