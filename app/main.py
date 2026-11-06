@@ -1,7 +1,10 @@
+import os
 import asyncio
 import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
+from fastapi.responses import HTMLResponse
+
 from app.config import settings
 from app.api.routes import router
 from app.services.stream import run_intraday_tick_loop
@@ -35,6 +38,15 @@ app = FastAPI(
 )
 
 app.include_router(router, prefix="/api")
+
+
+@app.get("/", response_class=HTMLResponse)
+async def serve_dashboard():
+    template_path = os.path.join(os.path.dirname(__file__), "templates", "index.html")
+    if os.path.exists(template_path):
+        with open(template_path, "r", encoding="utf-8") as f:
+            return f.read()
+    return "<h1>Trading Desk V2 API Online</h1><p>Visit /api/status for JSON diagnostics.</p>"
 
 
 if __name__ == "__main__":

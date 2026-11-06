@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Trading Desk V2 - Day Trading Terminal</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&display=swap">
+  <style>
+    :root {
+      --bg: #0d1117;
+      --card: #161b22;
+      --border: #30363d;
+      --text: #c9d1d9;
+      --text-muted: #8b949e;
+      --green: #2ea043;
+      --red: #f85149;
+      --blue: #58a6ff;
+      --yellow: #d29922;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background-color: var(--bg);
+      color: var(--text);
+      font-family: 'JetBrains Mono', monospace;
+      padding: 1.5rem;
+      font-size: 0.85rem;
+    }
+    header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding-bottom: 1rem;
+      border-bottom: 1px solid var(--border);
+      margin-bottom: 1.5rem;
+    }
+    .badge {
+      padding: 0.25rem 0.6rem;
+      border-radius: 4px;
+      font-weight: 600;
+      font-size: 0.75rem;
+      text-transform: uppercase;
+    }
+    .badge-active { background: rgba(46,160,67,0.2); color: var(--green); border: 1px solid var(--green); }
+    .badge-paused { background: rgba(210,153,34,0.2); color: var(--yellow); border: 1px solid var(--yellow); }
+    .btn {
+      padding: 0.4rem 0.8rem;
+      border-radius: 4px;
+      border: 1px solid var(--border);
+      background: var(--card);
+      color: var(--text);
+      cursor: pointer;
+      font-family: inherit;
+      font-weight: 600;
+      transition: background 0.2s;
+    }
+    .btn:hover { background: #21262d; }
+    .btn-danger { background: rgba(248,81,73,0.15); color: var(--red); border-color: var(--red); }
+    .btn-danger:hover { background: rgba(248,81,73,0.3); }
+    .btn-primary { background: rgba(88,166,255,0.15); color: var(--blue); border-color: var(--blue); }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 1rem; margin-bottom: 1.5rem; }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 1rem;
+    }
+    .card h3 {
+      font-size: 0.8rem;
+      color: var(--text-muted);
+      margin-bottom: 0.5rem;
+      text-transform: uppercase;
+    }
+    .card .val { font-size: 1.4rem; font-weight: 700; }
+    .positive { color: var(--green); }
+    .negative { color: var(--red); }
+    table { width: 100%; border-collapse: collapse; margin-top: 0.5rem; }
+    th, td {
+      padding: 0.6rem 0.8rem;
+      text-align: left;
+      border-bottom: 1px solid var(--border);
+    }
+    th { color: var(--text-muted); font-size: 0.75rem; text-transform: uppercase; }
+    .actions { display: flex; gap: 0.5rem; }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1 style="font-size: 1.2rem; font-weight: 700;">TRADING DESK V2 // INTRADAY CONSOLE</h1>
+      <span id="session-phase" class="badge" style="background:#21262d; color:var(--text); margin-top:0.3rem; display:inline-block;">SESSION: DETECTING...</span>
+    </div>
+    <div class="actions">
+      <span id="engine-badge" class="badge badge-paused">PAUSED</span>
+      <button id="toggle-btn" class="btn" onclick="toggleEngine()">START ENGINE</button>
+      <button class="btn btn-danger" onclick="flattenAll()">PANIC FLATTEN</button>
+    </div>
+  </header>
+
+  <div class="grid">
+    <div class="card">
+      <h3>Net Daily P&L</h3>
+      <div id="net-pnl" class="val">$0.00</div>
+    </div>
+    <div class="card">
+      <h3>Realized P&L</h3>
+      <div id="realized-pnl" class="val">$0.00</div>
+    </div>
+    <div class="card">
+      <h3>Unrealized P&L</h3>
+      <div id="unrealized-pnl" class="val">$0.00</div>
+    </div>
+    <div class="card">
+      <h3>Active Positions</h3>
+      <div id="positions-count" class="val">0</div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-bottom: 1.5rem;">
+    <h3>Active Market Ticker Radar (1m Candles)</h3>
+    <table>
+      <thead>
+        <tr>
+          <th>Ticker</th>
+          <th>Price</th>
+          <th>VWAP</th>
+          <th>EMA 9/21</th>
+          <th>RSI (14)</th>
+          <th>ATR (14)</th>
+          <th>Signal</th>
+          <th>Action</th>
+        </tr>
+      </thead>
+      <tbody id="ticker-tbody">
+        <tr><td colspan="8" style="color:var(--text-muted)">Loading intraday market feed...</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="card" style="margin-bottom: 1.5rem;">
+    <h3>Open Intraday Positions</h3>
+    <table>
+      <thead>
+        <tr>
+          <th>Ticker</th>
+          <th>Type</th>
+          <th>Shares</th>
+          <th>Entry</th>
+          <th>Current</th>
+          <th>Stop Loss</th>
+          <th>Target</th>
+          <th>Unrealized P&L</th>
+          <th>Close</th>
+        </tr>
+      </thead>
+      <tbody id="positions-tbody">
+        <tr><td colspan="9" style="color:var(--text-muted)">No active positions.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <h3>Closed Trade Journal (SQLite)</h3>
+    <table>
+      <thead>
+        <tr>
+          <th>Time</th>
+          <th>Ticker</th>
+          <th>Side</th>
+          <th>Shares</th>
+          <th>Entry</th>
+          <th>Exit</th>
+          <th>P&L ($)</th>
+          <th>P&L (%)</th>
+          <th>Reason</th>
+        </tr>
+      </thead>
+      <tbody id="trades-tbody">
+        <tr><td colspan="9" style="color:var(--text-muted)">No trade history recorded yet.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <script>
+    async function fetchStatus() {
+      try {
+        const res = await fetch('/api/status');
+        const data = await res.json();
+
+        // Header and metrics
+        document.getElementById('session-phase').innerText = `SESSION: ${data.session_phase}`;
+        const badge = document.getElementById('engine-badge');
+        const btn = document.getElementById('toggle-btn');
+        if (data.is_active) {
+          badge.className = 'badge badge-active';
+          badge.innerText = 'ACTIVE';
+          btn.innerText = 'PAUSE ENGINE';
+        } else {
+          badge.className = 'badge badge-paused';
+          badge.innerText = 'PAUSED';
+          btn.innerText = 'START ENGINE';
+        }
+
+        const netPnl = data.net_daily_pnl || 0;
+        const netEl = document.getElementById('net-pnl');
+        netEl.innerText = `${netPnl >= 0 ? '+' : ''}$${netPnl.toFixed(2)}`;
+        netEl.className = `val ${netPnl >= 0 ? 'positive' : 'negative'}`;
+
+        document.getElementById('realized-pnl').innerText = `$${(data.daily_realized_pnl || 0).toFixed(2)}`;
+        document.getElementById('unrealized-pnl').innerText = `$${(data.daily_unrealized_pnl || 0).toFixed(2)}`;
+        document.getElementById('positions-count').innerText = data.open_positions_count || 0;
+
+        // Populate Positions Table
+        const posTbody = document.getElementById('positions-tbody');
+        const posKeys = Object.keys(data.open_positions || {});
+        if (posKeys.length === 0) {
+          posTbody.innerHTML = '<tr><td colspan="9" style="color:var(--text-muted)">No active positions.</td></tr>';
+        } else {
+          posTbody.innerHTML = posKeys.map(k => {
+            const p = data.open_positions[k];
+            const pnlClass = p.unrealized_pnl >= 0 ? 'positive' : 'negative';
+            return `<tr>
+              <td><strong>${p.ticker}</strong></td>
+              <td><span class="badge ${p.action === 'BUY' ? 'badge-active' : 'badge-danger'}">${p.action}</span></td>
+              <td>${p.shares}</td>
+              <td>$${p.entry_price.toFixed(2)}</td>
+              <td>$${(p.current_price || p.entry_price).toFixed(2)}</td>
+              <td>$${p.stop_loss.toFixed(2)}</td>
+              <td>$${p.take_profit.toFixed(2)}</td>
+              <td class="${pnlClass}">${p.unrealized_pnl >= 0 ? '+' : ''}$${p.unrealized_pnl.toFixed(2)}</td>
+              <td><button class="btn btn-danger" onclick="closePosition('${p.ticker}')">Close</button></td>
+            </tr>`;
+          }).join('');
+        }
+
+        // Populate Ticker Matrix
+        const tickTbody = document.getElementById('ticker-tbody');
+        if (data.active_tickers && data.active_tickers.length > 0) {
+          const rows = await Promise.all(data.active_tickers.map(async t => {
+            const q = data.latest_quotes[t] || {};
+            let sigData = {};
+            try {
+              const sigRes = await fetch(`/api/signals/${t}`);
+              if (sigRes.ok) sigData = (await sigRes.json()).analysis || {};
+            } catch (e) {}
+            const m = sigData.metrics || {};
+            return `<tr>
+              <td><strong>${t}</strong></td>
+              <td>$${q.price ? q.price.toFixed(2) : '--'}</td>
+              <td>$${m.vwap ? m.vwap.toFixed(2) : '--'}</td>
+              <td>${m.ema_9 || '--'} / ${m.ema_21 || '--'}</td>
+              <td>${m.rsi_14 || '--'}</td>
+              <td>${m.atr_14 || '--'}</td>
+              <td><span class="badge" style="background:#21262d; border:1px solid var(--border);">${sigData.signal || 'NEUTRAL'}</span></td>
+              <td><button class="btn btn-primary" onclick="evaluateTicker('${t}')">Gemini Scan</button></td>
+            </tr>`;
+          }));
+          tickTbody.innerHTML = rows.join('');
+        }
+
+      } catch (err) {
+        console.error("Dashboard poll failed:", err);
+      }
+    }
+
+    async function fetchTrades() {
+      try {
+        const res = await fetch('/api/trades/history');
+        const data = await res.json();
+        const tbody = document.getElementById('trades-tbody');
+        if (!data.trades || data.trades.length === 0) {
+          tbody.innerHTML = '<tr><td colspan="9" style="color:var(--text-muted)">No trade history recorded yet.</td></tr>';
+          return;
+        }
+        tbody.innerHTML = data.trades.map(t => {
+          const pnlClass = t.pnl >= 0 ? 'positive' : 'negative';
+          return `<tr>
+            <td style="color:var(--text-muted)">${t.exit_time ? t.exit_time.split('T')[1].slice(0,8) : '--'}</td>
+            <td><strong>${t.ticker}</strong></td>
+            <td>${t.action}</td>
+            <td>${t.shares}</td>
+            <td>$${t.entry_price.toFixed(2)}</td>
+            <td>$${t.exit_price.toFixed(2)}</td>
+            <td class="${pnlClass}">${t.pnl >= 0 ? '+' : ''}$${t.pnl.toFixed(2)}</td>
+            <td class="${pnlClass}">${t.pnl_pct >= 0 ? '+' : ''}${t.pnl_pct.toFixed(2)}%</td>
+            <td>${t.exit_reason}</td>
+          </tr>`;
+        }).join('');
+      } catch (e) {
+        console.error("Trades poll failed:", e);
+      }
+    }
+
+    async function toggleEngine() {
+      await fetch('/api/session/toggle', { method: 'POST' });
+      fetchStatus();
+    }
+
+    async function closePosition(ticker) {
+      if (confirm(`Close open position for ${ticker}?`)) {
+        await fetch(`/api/positions/${ticker}/close`, { method: 'POST' });
+        fetchStatus();
+        fetchTrades();
+      }
+    }
+
+    async function flattenAll() {
+      if (confirm("EMERGENCY FLATTEN: Close ALL open positions immediately?")) {
+        await fetch('/api/positions/flatten', { method: 'POST' });
+        fetchStatus();
+        fetchTrades();
+      }
+    }
+
+    async function evaluateTicker(ticker) {
+      const res = await fetch(`/api/evaluate/${ticker}`, { method: 'POST' });
+      const data = await res.json();
+      const d = data.decision;
+      alert(`[${ticker}] Action: ${d.action} (Confidence: ${d.confidence}%)\nTarget: $${d.take_profit} | Stop: $${d.stop_loss}\n\nThesis: ${d.reasoning}`);
+    }
+
+    // Auto-refresh cadence
+    fetchStatus();
+    fetchTrades();
+    setInterval(fetchStatus, 3000);
+    setInterval(fetchTrades, 10000);
+  </script>
+</body>
+</html>
