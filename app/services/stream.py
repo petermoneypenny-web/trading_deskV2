@@ -5,6 +5,14 @@ from zoneinfo import ZoneInfo
 from typing import Dict
 import yfinance as yf
 import pandas as pd
+import os
+
+# Configure custom cache directory to silence Docker container cache warning
+os.makedirs("/tmp/py-yfinance", exist_ok=True)
+try:
+    yf.set_tz_cache_location("/tmp/py-yfinance")
+except Exception:
+    pass
 
 from app.core.state import system_state
 from app.services.buffer import buffer_manager

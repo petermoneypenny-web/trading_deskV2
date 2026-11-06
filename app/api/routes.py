@@ -158,7 +158,7 @@ async def get_trade_history(limit: int = 50):
 
 
 @router.get("/buffer/{ticker}")
-async def get_ticker_buffer(ticker: str, interval: str = Query("1m", regex="^(1m|5m)$")):
+async def get_ticker_buffer(ticker: str, interval: str = Query("1m", pattern="^(1m|5m)$")):
     ticker_upper = ticker.upper()
     df = buffer_manager.get_dataframe(ticker_upper, interval=interval)
     if df.empty:
