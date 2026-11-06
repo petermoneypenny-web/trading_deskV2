@@ -7,8 +7,9 @@ from app.config import settings
 
 logger = logging.getLogger("trading_desk_v2.gemini")
 
-# Use stable v1 endpoint for gemini-1.5-flash
-BASE_GEMINI_URL = "https://generativelanguage.googleapis.com/v1/models"
+# Confirmed endpoint and model from your account's supported models
+BASE_GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models"
+MODEL_NAME = getattr(settings, "GEMINI_MODEL", "gemini-2.5-flash")
 
 SYSTEM_INSTRUCTION = """You are an institutional intraday momentum trader and execution agent.
 Your objective is to evaluate real-time technical indicators, VWAP positioning, Opening Range Breakout (ORB) levels, and momentum metrics to issue precise day-trading decisions.
@@ -22,41 +23,6 @@ Rules:
 6. Response Format: Output strictly a valid raw JSON object matching the requested schema. No conversational preamble, explanation, or markdown fences.
 """
 
-DECISION_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "action": {
-            "type": "string",
-            "enum": ["BUY", "SELL", "HOLD"]
-        },
-        "confidence": {
-            "type": "integer",
-            "description": "Confidence level between 0 and 100"
-        },
-        "entry_price": {
-            "type": "number",
-            "description": "Suggested entry price"
-        },
-        "stop_loss": {
-            "type": "number",
-            "description": "Hard stop-loss level"
-        },
-        "take_profit": {
-            "type": "number",
-            "description": "Target profit exit level"
-        },
-        "risk_reward_ratio": {
-            "type": "number",
-            "description": "Calculated reward-to-risk ratio (e.g. 1.8)"
-        },
-        "reasoning": {
-            "type": "string",
-            "description": "1 to 2 sentences explaining key technical conviction"
-        }
-    },
-    "required": ["action", "confidence", "entry_price", "stop_loss", "take_profit", "risk_reward_ratio", "reasoning"]
-}
-
 
 async def evaluate_intraday_opportunity(
     ticker: str,
@@ -64,7 +30,7 @@ async def evaluate_intraday_opportunity(
     technical_analysis: Dict[str, Any]
 ) -> Dict[str, Any]:
     """
-    Asynchronously queries Gemini Flash to evaluate an intraday setup.
+    Asynchronously queries Gemini 2.5 Flash on v1beta to evaluate an intraday setup.
     """
     if not settings.GEMINI_API_KEY:
         logger.warning("GEMINI_API_KEY is not configured. Defaulting to HOLD.")
@@ -108,15 +74,15 @@ Current Indicator Snapshot:
 - Algorithmic Signal: {signal}
 - Bias Score: {technical_analysis.get('bias_score', 0)}
 
-Required JSON schema:
+Required JSON format:
 {{
   "action": "BUY" | "SELL" | "HOLD",
-  "confidence": 0-100,
-  "entry_price": float,
-  "stop_loss": float,
-  "take_profit": float,
-  "risk_reward_ratio": float,
-  "reasoning": "string"
+  "confidence": 75,
+  "entry_price": 734.25,
+  "stop_loss": 732.50,
+  "take_profit": 737.50,
+  "risk_reward_ratio": 1.85,
+  "reasoning": "Brief explanation"
 }}
 Return ONLY raw JSON."""
 
@@ -129,15 +95,14 @@ Return ONLY raw JSON."""
         ],
         "generationConfig": {
             "temperature": 0.1,
-            "response_mime_type": "application/json"
+            "responseMimeType": "application/json"
         }
     }
 
-    model_name = getattr(settings, "GEMINI_MODEL", "gemini-1.5-flash")
-    url = f"{BASE_GEMINI_URL}/{model_name}:generateContent?key={settings.GEMINI_API_KEY}"
+    url = f"{BASE_GEMINI_URL}/{MODEL_NAME}:generateContent?key={settings.GEMINI_API_KEY}"
 
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(timeout=12.0) as client:
             response = await client.post(url, json=payload)
             if response.status_code != 200:
                 err_text = response.text
@@ -149,11 +114,12 @@ Return ONLY raw JSON."""
                     "stop_loss": 0.0,
                     "take_profit": 0.0,
                     "risk_reward_ratio": 0.0,
-                    "reasoning": f"Gemini API error ({response.status_code}): {err_text[:120]}"
+                    "reasoning": f"Gemini API error ({response.status_code}): {err_text[:140]}"
                 }
 
             result_data = response.json()
             raw_text = result_data["candidates"][0]["content"]["parts"][0]["text"].strip()
+            
             # Clean possible markdown wrapping if returned
             if raw_text.startswith("```json"):
                 raw_text = raw_text[7:]
