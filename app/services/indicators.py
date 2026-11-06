@@ -1,9 +1,21 @@
+import math
 from typing import Dict, Any, Optional
 import pandas as pd
 import numpy as np
 import logging
 
 logger = logging.getLogger("trading_desk_v2.indicators")
+
+
+def _sanitize_float(val: Any, default: Optional[float] = None) -> Optional[float]:
+    """Ensures floats are JSON-compliant and replaces NaN/Inf with default or None."""
+    try:
+        f = float(val)
+        if math.isnan(f) or math.isinf(f):
+            return default
+        return round(f, 4)
+    except (TypeError, ValueError):
+        return default
 
 
 def calculate_vwap(df: pd.DataFrame) -> pd.Series:
@@ -20,9 +32,9 @@ def calculate_vwap(df: pd.DataFrame) -> pd.Series:
     cum_tp_vol = tp_vol.cumsum()
     cum_vol = df["volume"].cumsum()
 
-    # Avoid zero-division if pre-market volume is 0
+    # Avoid zero division
     vwap = cum_tp_vol / cum_vol.replace(0, np.nan)
-    return vwap.ffill()
+    return vwap.ffill().bfill()
 
 
 def calculate_emas(df: pd.DataFrame, fast_period: int = 9, slow_period: int = 21) -> Dict[str, pd.Series]:
@@ -67,33 +79,35 @@ def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     true_range = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
 
     atr = true_range.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
-    return atr.ffill()
+    return atr.ffill().bfill()
 
 
 def calculate_orb(df: pd.DataFrame, bars_count: int = 15) -> Dict[str, Optional[float]]:
     """
-    Calculates Opening Range Breakout (ORB) High and Low based on the first N bars.
-    Default uses the first 15 bars of the intraday series.
+    Calculates Opening Range Breakout (ORB) High and Low based on first N bars.
     """
     if df.empty or len(df) < bars_count:
         return {"orb_high": None, "orb_low": None}
 
     opening_slice = df.iloc[:bars_count]
+    high_val = _sanitize_float(opening_slice["high"].max())
+    low_val = _sanitize_float(opening_slice["low"].min())
     return {
-        "orb_high": float(opening_slice["high"].max()),
-        "orb_low": float(opening_slice["low"].min())
+        "orb_high": high_val,
+        "orb_low": low_val
     }
 
 
 def evaluate_intraday_technical_snapshot(df: pd.DataFrame) -> Dict[str, Any]:
     """
-    Combines indicators into an actionable technical snapshot and preliminary trade setup bias.
+    Combines indicators into a sanitized, JSON-safe technical snapshot.
     """
     if df.empty or len(df) < 25:
         return {
             "status": "INSUFFICIENT_DATA",
             "bars_analyzed": len(df),
             "signal": "NEUTRAL",
+            "bias_score": 0,
             "metrics": {}
         }
 
@@ -103,43 +117,46 @@ def evaluate_intraday_technical_snapshot(df: pd.DataFrame) -> Dict[str, Any]:
     atr_series = calculate_atr(df, period=14)
     orb = calculate_orb(df, bars_count=15)
 
-    last_close = float(df["close"].iloc[-1])
-    current_vwap = float(vwap_series.iloc[-1]) if not vwap_series.empty else last_close
-    current_ema_fast = float(emas["ema_fast"].iloc[-1]) if not emas["ema_fast"].empty else last_close
-    current_ema_slow = float(emas["ema_slow"].iloc[-1]) if not emas["ema_slow"].empty else last_close
-    current_rsi = float(rsi_series.iloc[-1]) if not rsi_series.empty else 50.0
-    current_atr = float(atr_series.iloc[-1]) if not atr_series.empty else 0.5
+    last_close = _sanitize_float(df["close"].iloc[-1], default=0.0)
+    current_vwap = _sanitize_float(vwap_series.iloc[-1] if not vwap_series.empty else last_close, default=last_close)
+    current_ema_fast = _sanitize_float(emas["ema_fast"].iloc[-1] if not emas["ema_fast"].empty else last_close, default=last_close)
+    current_ema_slow = _sanitize_float(emas["ema_slow"].iloc[-1] if not emas["ema_slow"].empty else last_close, default=last_close)
+    current_rsi = _sanitize_float(rsi_series.iloc[-1] if not rsi_series.empty else 50.0, default=50.0)
+    current_atr = _sanitize_float(atr_series.iloc[-1] if not atr_series.empty else 0.5, default=0.5)
+
+    # Calculate distance from VWAP safely
+    dist_from_vwap_pct = None
+    if current_vwap and current_vwap > 0 and last_close:
+        dist_from_vwap_pct = _sanitize_float(((last_close - current_vwap) / current_vwap) * 100.0)
 
     # Determine Setup Signals
     signal = "NEUTRAL"
-    bias_score = 0  # Range -3 to +3
+    bias_score = 0
 
-    # Trend alignment: Above VWAP and Fast EMA > Slow EMA
-    if last_close > current_vwap and current_ema_fast > current_ema_slow:
+    if last_close and current_vwap and current_ema_fast and current_ema_slow:
+        if last_close > current_vwap and current_ema_fast > current_ema_slow:
+            bias_score += 1
+        elif last_close < current_vwap and current_ema_fast < current_ema_slow:
+            bias_score -= 1
+
+    if orb["orb_high"] and last_close and last_close > orb["orb_high"]:
         bias_score += 1
-    elif last_close < current_vwap and current_ema_fast < current_ema_slow:
+    elif orb["orb_low"] and last_close and last_close < orb["orb_low"]:
         bias_score -= 1
 
-    # ORB Breakout validation
-    if orb["orb_high"] and last_close > orb["orb_high"]:
-        bias_score += 1
-    elif orb["orb_low"] and last_close < orb["orb_low"]:
-        bias_score -= 1
+    if current_rsi is not None:
+        if current_rsi > 55:
+            bias_score += 1
+        elif current_rsi < 45:
+            bias_score -= 1
 
-    # Momentum filter (RSI)
-    if current_rsi > 55:
-        bias_score += 1
-    elif current_rsi < 45:
-        bias_score -= 1
-
-    # Classify final setup signal
     if bias_score >= 2:
         signal = "BULLISH_MOMENTUM"
     elif bias_score <= -2:
         signal = "BEARISH_MOMENTUM"
-    elif current_rsi < 30 and last_close > current_ema_fast:
+    elif current_rsi is not None and current_rsi < 30 and current_ema_fast and last_close and last_close > current_ema_fast:
         signal = "OVERSOLD_REVERSAL_LONG"
-    elif current_rsi > 70 and last_close < current_ema_fast:
+    elif current_rsi is not None and current_rsi > 70 and current_ema_fast and last_close and last_close < current_ema_fast:
         signal = "OVERBOUGHT_REVERSAL_SHORT"
 
     return {
@@ -148,14 +165,14 @@ def evaluate_intraday_technical_snapshot(df: pd.DataFrame) -> Dict[str, Any]:
         "signal": signal,
         "bias_score": bias_score,
         "metrics": {
-            "last_price": round(last_close, 2),
-            "vwap": round(current_vwap, 2),
-            "ema_9": round(current_ema_fast, 2),
-            "ema_21": round(current_ema_slow, 2),
-            "rsi_14": round(current_rsi, 2),
-            "atr_14": round(current_atr, 2),
-            "orb_high": round(orb["orb_high"], 2) if orb["orb_high"] else None,
-            "orb_low": round(orb["orb_low"], 2) if orb["orb_low"] else None,
-            "dist_from_vwap_pct": round(((last_close - current_vwap) / current_vwap) * 100, 3)
+            "last_price": last_close,
+            "vwap": current_vwap,
+            "ema_9": current_ema_fast,
+            "ema_21": current_ema_slow,
+            "rsi_14": current_rsi,
+            "atr_14": current_atr,
+            "orb_high": orb["orb_high"],
+            "orb_low": orb["orb_low"],
+            "dist_from_vwap_pct": dist_from_vwap_pct
         }
     }
