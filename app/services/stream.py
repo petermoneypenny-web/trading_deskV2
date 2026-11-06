@@ -157,42 +157,73 @@ async def sync_market_data():
                 buffer_manager.load_initial_history(ticker, df, interval="1m")
                 last_bar = buffer_manager.get_latest_bar(ticker, interval="1m")
                 if last_bar:
+                    real_price = float(last_bar["close"])
                     system_state.latest_quotes[ticker] = {
-                        "price": last_bar["close"],
+                        "price": real_price,
                         "high": last_bar["high"],
                         "low": last_bar["low"],
                         "volume": last_bar["volume"],
                         "timestamp": last_bar["timestamp"]
                     }
 
-                buffer_df = buffer_manager.get_dataframe(ticker, interval="1m")
-                analysis = evaluate_intraday_technical_snapshot(buffer_df)
-                system_state.technical_analysis[ticker] = analysis
+                    buffer_df = buffer_manager.get_dataframe(ticker, interval="1m")
+                    analysis = evaluate_intraday_technical_snapshot(buffer_df)
+                    system_state.technical_analysis[ticker] = analysis
 
-                # Evaluate Gemini and execute during active trading phases
-                if system_state.is_active and system_state.session_phase in ("RTH_OPEN", "RTH_NORMAL"):
-                    if analysis.get("signal") not in ("NEUTRAL", None):
-                        decision = await evaluate_intraday_opportunity(
-                            ticker=ticker,
-                            session_phase=system_state.session_phase,
-                            technical_analysis=analysis
-                        )
-                        system_state.agent_evaluations[ticker] = {
-                            "timestamp": datetime.utcnow().isoformat(),
-                            "decision": decision
-                        }
-
-                        action = decision.get("action")
-                        confidence = decision.get("confidence", 0)
-                        if action in ("BUY", "SELL") and confidence >= 75 and ticker not in system_state.open_positions:
-                            await open_position(
+                    # Evaluate Gemini and execute during active trading phases
+                    if system_state.is_active and system_state.session_phase in ("RTH_OPEN", "RTH_NORMAL"):
+                        if analysis.get("signal") not in ("NEUTRAL", None):
+                            decision = await evaluate_intraday_opportunity(
                                 ticker=ticker,
-                                action=action,
-                                entry_price=decision["entry_price"],
-                                stop_loss=decision["stop_loss"],
-                                take_profit=decision["take_profit"],
-                                reasoning=decision["reasoning"]
+                                session_phase=system_state.session_phase,
+                                technical_analysis=analysis
                             )
+                            system_state.agent_evaluations[ticker] = {
+                                "timestamp": datetime.utcnow().isoformat(),
+                                "decision": decision
+                            }
+
+                            action = decision.get("action")
+                            confidence = decision.get("confidence", 0)
+                            
+                            if action in ("BUY", "SELL") and confidence >= 75 and ticker not in system_state.open_positions:
+                                metrics = analysis.get("metrics", {})
+                                raw_atr = metrics.get("atr_14")
+                                atr = float(raw_atr) if raw_atr and raw_atr > 0 else max(0.5, real_price * 0.003)
+
+                                raw_sl = decision.get("stop_loss")
+                                raw_tp = decision.get("take_profit")
+
+                                # Sanitize and enforce realistic volatility stops anchored to actual market price
+                                if action == "BUY":
+                                    if not raw_sl or raw_sl >= real_price or (real_price - raw_sl) < (0.5 * atr):
+                                        stop_loss = round(real_price - (1.5 * atr), 2)
+                                    else:
+                                        stop_loss = round(float(raw_sl), 2)
+
+                                    if not raw_tp or raw_tp <= real_price:
+                                        take_profit = round(real_price + (2.5 * atr), 2)
+                                    else:
+                                        take_profit = round(float(raw_tp), 2)
+                                else:  # SELL / SHORT
+                                    if not raw_sl or raw_sl <= real_price or (raw_sl - real_price) < (0.5 * atr):
+                                        stop_loss = round(real_price + (1.5 * atr), 2)
+                                    else:
+                                        stop_loss = round(float(raw_sl), 2)
+
+                                    if not raw_tp or raw_tp >= real_price:
+                                        take_profit = round(real_price - (2.5 * atr), 2)
+                                    else:
+                                        take_profit = round(float(raw_tp), 2)
+
+                                await open_position(
+                                    ticker=ticker,
+                                    action=action,
+                                    current_price=real_price,
+                                    stop_loss=stop_loss,
+                                    take_profit=take_profit,
+                                    reasoning=decision.get("reasoning", "Algorithmic momentum entry")
+                                )
 
         system_state.last_fetch_error = None
 

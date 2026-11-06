@@ -1,7 +1,7 @@
 import sqlite3
 import logging
 from typing import Dict, Any, Optional
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from app.core.state import system_state
 from app.config import settings
@@ -9,13 +9,16 @@ from app.services.alerts import send_ntfy_alert
 
 logger = logging.getLogger("trading_desk_v2.risk")
 
-MAX_DAILY_LOSS = 250.0
-MAX_RISK_PER_TRADE = 50.0
-DEFAULT_ACCOUNT_EQUITY = 10000.0
+MAX_DAILY_LOSS = 250.0        # Circuit breaker
+MAX_RISK_PER_TRADE = 50.0     # Max risk budget
+MAX_POSITION_VALUE = 2500.0   # HARD CAP: Max position dollar exposure (prevents 1000-share blowups)
+COOLDOWN_MINUTES = 20         # Wait 20 mins after exiting a ticker before re-entering
+
+# In-memory cooldown tracking: {ticker: datetime_of_last_exit}
+ticker_cooldowns: Dict[str, datetime] = {}
 
 
 def init_db():
-    """Initializes SQLite database tables for trades and performance tracking."""
     db_path = settings.DATABASE_URL.replace("sqlite:///", "")
     with sqlite3.connect(db_path) as conn:
         cursor = conn.cursor()
@@ -38,39 +41,24 @@ def init_db():
         """)
         conn.commit()
 
-def load_open_positions_on_startup():
-    """Restores unclosed trades from SQLite on container startup."""
-    db_path = settings.DATABASE_URL.replace("sqlite:///", "")
-    with sqlite3.connect(db_path) as conn:
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM trades WHERE exit_time IS NULL")
-        rows = cursor.fetchall()
-        for r in rows:
-            system_state.open_positions[r["ticker"]] = {
-                "ticker": r["ticker"],
-                "action": r["action"],
-                "shares": r["shares"],
-                "entry_price": r["entry_price"],
-                "current_price": r["entry_price"],
-                "stop_loss": r["stop_loss"],
-                "take_profit": r["take_profit"],
-                "entry_time": r["entry_time"],
-                "unrealized_pnl": 0.0,
-                "reasoning": "Restored on boot"
-            }
 
 def calculate_position_size(entry_price: float, stop_loss: float, risk_budget: float = MAX_RISK_PER_TRADE) -> int:
-    """Calculates number of shares based on fixed dollar risk and stop loss distance."""
+    """Calculates shares using risk budget AND enforces a hard maximum total dollar cap."""
     per_share_risk = abs(entry_price - stop_loss)
-    if per_share_risk <= 0.001:
-        return 1
-    shares = int(risk_budget / per_share_risk)
-    return max(1, shares)
+    if per_share_risk <= 0.05:  # Minimum realistic stop distance
+        per_share_risk = entry_price * 0.005  # 0.5% default stop
+
+    # Shares based on risk budget
+    risk_shares = int(risk_budget / per_share_risk)
+    
+    # Shares based on max allowable portfolio capital per position
+    max_capital_shares = int(MAX_POSITION_VALUE / entry_price)
+    
+    final_shares = min(risk_shares, max_capital_shares)
+    return max(1, final_shares)
 
 
 async def check_daily_circuit_breaker() -> bool:
-    """Trips circuit breaker and pauses the trading engine if daily loss limit is exceeded."""
     total_daily_loss = system_state.daily_realized_pnl + system_state.daily_unrealized_pnl
     if total_daily_loss <= -MAX_DAILY_LOSS:
         if system_state.is_active:
@@ -82,23 +70,34 @@ async def check_daily_circuit_breaker() -> bool:
     return False
 
 
-async def open_position(ticker: str, action: str, entry_price: float, stop_loss: float, take_profit: float, reasoning: str):
-    """Evaluates risk rules and opens a new intraday paper position."""
+async def open_position(ticker: str, action: str, current_price: float, stop_loss: float, take_profit: float, reasoning: str):
+    """Opens position using LIVE MARKET PRICE, strictly validating stop loss and cooldowns."""
     if await check_daily_circuit_breaker():
-        logger.warning(f"Rejecting entry for {ticker}: Daily circuit breaker active.")
         return False
 
     if ticker in system_state.open_positions:
-        logger.info(f"Position already active for {ticker}. Ignoring duplicate signal.")
         return False
 
-    shares = calculate_position_size(entry_price, stop_loss)
+    # Check cooldown
+    last_exit = ticker_cooldowns.get(ticker)
+    if last_exit and datetime.utcnow() - last_exit < timedelta(minutes=COOLDOWN_MINUTES):
+        remaining = int((timedelta(minutes=COOLDOWN_MINUTES) - (datetime.utcnow() - last_exit)).total_seconds() / 60)
+        logger.info(f"Skipping entry for {ticker}: In cooldown for {remaining} more mins.")
+        return False
+
+    # Validate Stop Loss orientation
+    if action == "BUY" and stop_loss >= current_price:
+        stop_loss = round(current_price * 0.992, 2)  # Default 0.8% stop below price
+    elif action == "SELL" and stop_loss <= current_price:
+        stop_loss = round(current_price * 1.008, 2)  # Default 0.8% stop above price
+
+    shares = calculate_position_size(current_price, stop_loss)
     position = {
         "ticker": ticker,
         "action": action,
         "shares": shares,
-        "entry_price": entry_price,
-        "current_price": entry_price,
+        "entry_price": current_price,  # FORCED to real-time quote, never LLM hallucination
+        "current_price": current_price,
         "stop_loss": stop_loss,
         "take_profit": take_profit,
         "entry_time": datetime.utcnow().isoformat(),
@@ -107,17 +106,19 @@ async def open_position(ticker: str, action: str, entry_price: float, stop_loss:
     }
 
     system_state.open_positions[ticker] = position
-    alert_msg = f"{action} {shares} shares @ ${entry_price:.2f} | SL: ${stop_loss:.2f} | TP: ${take_profit:.2f}\n{reasoning}"
+    alert_msg = f"{action} {shares} shares @ ${current_price:.2f} (Total: ${shares*current_price:.2f}) | SL: ${stop_loss:.2f} | TP: ${take_profit:.2f}\n{reasoning}"
     logger.info(f"Position Opened: {ticker} {alert_msg}")
     await send_ntfy_alert(f"V2 ORDER EXECUTED: {action} {ticker}", alert_msg, priority=4)
     return True
 
 
 async def close_position(ticker: str, exit_price: float, exit_reason: str):
-    """Closes an active intraday position and logs the trade to SQLite."""
     position = system_state.open_positions.pop(ticker, None)
     if not position:
         return
+
+    # Set cooldown
+    ticker_cooldowns[ticker] = datetime.utcnow()
 
     shares = position["shares"]
     entry_price = position["entry_price"]
@@ -144,16 +145,15 @@ async def close_position(ticker: str, exit_price: float, exit_reason: str):
             """, (ticker, action, shares, entry_price, exit_price, position["stop_loss"], position["take_profit"], entry_time, exit_time, pnl, pnl_pct, exit_reason))
             conn.commit()
     except Exception as e:
-        logger.error(f"Failed to record trade to database: {e}")
+        logger.error(f"Failed to record trade: {e}")
 
     result_tag = "PROFIT" if pnl >= 0 else "LOSS"
-    alert_msg = f"Closed {ticker} ({action}) @ ${exit_price:.2f} [{exit_reason}]\nP&L: ${pnl:+.2f} ({pnl_pct:+.2f}%)\nDaily PnL: ${system_state.daily_realized_pnl:+.2f}"
+    alert_msg = f"Closed {ticker} ({action}) @ ${exit_price:.2f} [{exit_reason}]\nP&L: ${pnl:+.2f} ({pnl_pct:+.2f}%)\nDaily Realized: ${system_state.daily_realized_pnl:+.2f}"
     logger.info(f"Position Closed: {alert_msg}")
     await send_ntfy_alert(f"V2 POSITION CLOSED [{result_tag}]: {ticker}", alert_msg, priority=3)
 
 
 async def update_open_positions_and_risk(latest_quotes: Dict[str, Dict[str, Any]]):
-    """Checks stop loss, take profit targets, and updates unrealized P&L for every active position."""
     total_unrealized = 0.0
 
     for ticker in list(system_state.open_positions.keys()):
@@ -198,7 +198,6 @@ async def update_open_positions_and_risk(latest_quotes: Dict[str, Dict[str, Any]
 
 
 async def liquidate_all_positions(reason: str = "EOD_MANDATORY_CLOSE"):
-    """Flattens all positions at the end of the day or upon manual command."""
     for ticker in list(system_state.open_positions.keys()):
         quote = system_state.latest_quotes.get(ticker)
         exit_price = quote["price"] if quote else system_state.open_positions[ticker]["current_price"]
