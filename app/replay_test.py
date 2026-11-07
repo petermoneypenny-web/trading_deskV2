@@ -1,19 +1,17 @@
 import os
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime
 from zoneinfo import ZoneInfo
 import yfinance as yf
 import pandas as pd
 
-# Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("replay_test")
 
 from app.core.state import system_state
 from app.services.buffer import buffer_manager
 from app.services.indicators import evaluate_intraday_technical_snapshot
-from app.services.gemini_agent import evaluate_intraday_opportunity
 from app.services.risk_engine import (
     init_db,
     open_position,
@@ -22,13 +20,17 @@ from app.services.risk_engine import (
     ticker_cooldowns
 )
 
-# Test Tickers from yesterday's live session
 TICKERS = ["SPY", "QQQ", "AAPL", "NVDA", "INTC", "TSM", "MU"]
 
 
-def get_mock_session_phase(bar_time: datetime) -> str:
+def get_mock_session_phase(bar_time) -> str:
     """Calculates phase based on historical bar time in US Eastern."""
-    et_time = bar_time.astimezone(ZoneInfo("America/New_York"))
+    # Ensure timezone awareness in America/New_York
+    if bar_time.tzinfo is None:
+        et_time = bar_time.replace(tzinfo=ZoneInfo("UTC")).astimezone(ZoneInfo("America/New_York"))
+    else:
+        et_time = bar_time.astimezone(ZoneInfo("America/New_York"))
+
     time_mins = et_time.hour * 60 + et_time.minute
 
     if 9 * 60 + 30 <= time_mins < 10 * 60:
@@ -36,7 +38,7 @@ def get_mock_session_phase(bar_time: datetime) -> str:
     elif 10 * 60 <= time_mins < 11 * 60 + 45:
         return "RTH_NORMAL"
     elif 11 * 60 + 45 <= time_mins < 14 * 60 + 15:
-        return "RTH_MIDDAY"  # Gated: No new trades allowed
+        return "RTH_MIDDAY"
     elif 14 * 60 + 15 <= time_mins < 15 * 60 + 45:
         return "RTH_NORMAL"
     elif 15 * 60 + 45 <= time_mins < 16 * 60:
@@ -52,10 +54,8 @@ def update_macro_regime_bias():
     spy_m = spy_analysis.get("metrics", {})
     qqq_m = qqq_analysis.get("metrics", {})
 
-    spy_p = spy_m.get("last_price")
-    spy_v = spy_m.get("vwap")
-    qqq_p = qqq_m.get("last_price")
-    qqq_v = qqq_m.get("vwap")
+    spy_p, spy_v = spy_m.get("last_price"), spy_m.get("vwap")
+    qqq_p, qqq_v = qqq_m.get("last_price"), qqq_m.get("vwap")
 
     bull_score = (1 if spy_p and spy_v and spy_p > spy_v else 0) + (1 if qqq_p and qqq_v and qqq_p > qqq_v else 0)
     bear_score = (1 if spy_p and spy_v and spy_p < spy_v else 0) + (1 if qqq_p and qqq_v and qqq_p < qqq_v else 0)
@@ -72,7 +72,6 @@ async def run_replay():
     logger.info("Initializing yesterday's market data replay test...")
     init_db()
 
-    # Reset in-memory session state
     system_state.is_active = True
     system_state.active_tickers = TICKERS
     system_state.daily_realized_pnl = 0.0
@@ -81,7 +80,10 @@ async def run_replay():
     system_state.open_positions = {}
     ticker_cooldowns.clear()
 
-    # 1. Download yesterday's 1m bars for all tickers
+    # Clear buffers
+    for t in TICKERS:
+        buffer_manager.buffers.pop(t, None)
+
     ticker_str = " ".join(TICKERS)
     logger.info(f"Downloading historical 1m data for: {ticker_str}")
     raw_df = yf.download(
@@ -98,59 +100,52 @@ async def run_replay():
         logger.error("Failed to download historical bars.")
         return
 
-    # Extract all timestamps from yesterday (Nov 6)
+    # Extract all timestamps from yesterday (last available trading day)
     all_timestamps = sorted(list(raw_df.index))
-    # Filter strictly to the last available trading day
     last_trading_day = all_timestamps[-1].date()
     session_timestamps = [ts for ts in all_timestamps if ts.date() == last_trading_day]
     logger.info(f"Loaded {len(session_timestamps)} 1-minute bars for trading date: {last_trading_day}")
 
-    # Warm up buffer with the first 30 bars so indicators can calculate
-    warmup_bars = session_timestamps[:30]
-    replay_bars = session_timestamps[30:]
+    warmup_bars = session_timestamps[:35]
+    replay_bars = session_timestamps[35:]
 
-    for ts in warmup_bars:
-        for ticker in TICKERS:
-            try:
-                row = pd.DataFrame([{
-                    "open": float(raw_df[("Open", ticker)].loc[ts]),
-                    "high": float(raw_df[("High", ticker)].loc[ts]),
-                    "low": float(raw_df[("Low", ticker)].loc[ts]),
-                    "close": float(raw_df[("Close", ticker)].loc[ts]),
-                    "volume": float(raw_df[("Volume", ticker)].loc[ts]),
-                    "timestamp": ts.isoformat()
-                }], index=[ts])
-                buffer_manager.append_bar(ticker, row.iloc[0].to_dict(), interval="1m")
-            except Exception:
-                pass
+    # Pre-populate historical dataframe slices directly into the buffer manager
+    for ticker in TICKERS:
+        sub_df = pd.DataFrame(index=warmup_bars)
+        for metric in ["Open", "High", "Low", "Close", "Volume"]:
+            sub_df[metric] = raw_df[(metric, ticker)].loc[warmup_bars]
+        sub_df.dropna(subset=["Close"], inplace=True)
+        buffer_manager.load_initial_history(ticker, sub_df, interval="1m")
 
     logger.info("Buffer warmup complete. Commencing chronologic tick simulation...")
 
     trades_opened = 0
     blocked_by_macro = 0
     blocked_by_midday = 0
-    blocked_by_cooldown = 0
-    blocked_by_daily_cap = 0
+    phase_counts = {}
 
-    # 2. Step through each 1-minute bar chronologically
     for step_idx, ts in enumerate(replay_bars):
-        current_time_et = ts.astimezone(ZoneInfo("America/New_York"))
+        if ts.tzinfo is None:
+            et_time = ts.replace(tzinfo=ZoneInfo("UTC")).astimezone(ZoneInfo("America/New_York"))
+        else:
+            et_time = ts.astimezone(ZoneInfo("America/New_York"))
+
         session_phase = get_mock_session_phase(ts)
         system_state.session_phase = session_phase
+        phase_counts[session_phase] = phase_counts.get(session_phase, 0) + 1
 
-        # Update quotes & buffers for all tickers on this candle
         for ticker in TICKERS:
             try:
                 close_p = float(raw_df[("Close", ticker)].loc[ts])
                 high_p = float(raw_df[("High", ticker)].loc[ts])
                 low_p = float(raw_df[("Low", ticker)].loc[ts])
                 vol_p = float(raw_df[("Volume", ticker)].loc[ts])
-
+                open_p = float(raw_df[("Open", ticker)].loc[ts])
                 if pd.isna(close_p):
                     continue
 
                 bar_dict = {
-                    "open": float(raw_df[("Open", ticker)].loc[ts]),
+                    "open": open_p,
                     "high": high_p,
                     "low": low_p,
                     "close": close_p,
@@ -174,17 +169,13 @@ async def run_replay():
                 continue
 
         update_macro_regime_bias()
-
-        # Update stops/targets on existing positions
         await update_open_positions_and_risk(system_state.latest_quotes)
 
-        # Check for EOD auto-liquidation
         if session_phase == "RTH_EOD_CLOSING" and system_state.open_positions:
-            logger.info(f"[{current_time_et.strftime('%H:%M')}] RTH_EOD_CLOSING reached. Liquidating open positions.")
+            logger.info(f"[{et_time.strftime('%H:%M')}] RTH_EOD_CLOSING reached. Liquidating open positions.")
             await liquidate_all_positions(reason="RTH_EOD_AUTO_CLOSE")
             continue
 
-        # If in Midday Chop Window, count and reject any entry attempts
         if session_phase == "RTH_MIDDAY":
             for ticker in TICKERS:
                 analysis = system_state.technical_analysis.get(ticker, {})
@@ -192,23 +183,18 @@ async def run_replay():
                     blocked_by_midday += 1
             continue
 
-        # Active Session Entry Evaluation (09:30-11:45 & 14:15-15:45 ET)
         if session_phase in ("RTH_OPEN", "RTH_NORMAL"):
             for ticker in TICKERS:
                 analysis = system_state.technical_analysis.get(ticker, {})
                 signal = analysis.get("signal", "NEUTRAL")
-
                 if signal in ("NEUTRAL", None) or ticker in system_state.open_positions:
                     continue
 
                 real_price = system_state.latest_quotes[ticker]["price"]
                 metrics = analysis.get("metrics", {})
                 atr = float(metrics.get("atr_14", 1.0) or 1.0)
-
-                # Simulated algorithmic action from technical setup
                 action = "BUY" if "BULLISH" in signal or "LONG" in signal else "SELL"
 
-                # Check Macro Filter
                 if action == "BUY" and system_state.macro_bias == "BEARISH":
                     blocked_by_macro += 1
                     continue
@@ -216,9 +202,7 @@ async def run_replay():
                     blocked_by_macro += 1
                     continue
 
-                # Calibrate wider stops (>= 2.2x ATR and >= 0.55%)
                 min_stop_distance = max(atr * 2.2, real_price * 0.0055)
-
                 if action == "BUY":
                     stop_loss = round(real_price - min_stop_distance, 2)
                     take_profit = round(real_price + (min_stop_distance * 2.0), 2)
@@ -234,16 +218,15 @@ async def run_replay():
                     take_profit=take_profit,
                     reasoning=f"Replay simulated {signal} (Macro: {system_state.macro_bias})"
                 )
-
                 if opened:
                     trades_opened += 1
-                    logger.info(f"[{current_time_et.strftime('%H:%M')} ET] OPENED {action} {ticker} @ ${real_price:.2f} | SL: ${stop_loss} | TP: ${take_profit}")
+                    logger.info(f"[{et_time.strftime('%H:%M')} ET] OPENED {action} {ticker} @ ${real_price:.2f} | SL: ${stop_loss} | TP: ${take_profit}")
 
-    # Final summary statistics
     logger.info("=" * 60)
     logger.info("REPLAY BACKTEST COMPLETED")
     logger.info("=" * 60)
-    logger.info(f"Total Trades Opened: {trades_opened} (vs 49 yesterday in unconstrained live)")
+    logger.info(f"Session Phases Encountered: {phase_counts}")
+    logger.info(f"Total Trades Opened: {trades_opened}")
     logger.info(f"Entries Blocked by Midday Chop Window: {blocked_by_midday}")
     logger.info(f"Entries Blocked by Macro Bias Filter: {blocked_by_macro}")
     logger.info(f"Final Realized P&L: ${system_state.daily_realized_pnl:+.2f}")
