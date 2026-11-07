@@ -18,10 +18,11 @@ async def scheduled_market_open():
     system_state.is_active = True
     system_state.daily_realized_pnl = 0.0
     system_state.daily_unrealized_pnl = 0.0
+    system_state.daily_trade_counts = {}  # Reset daily per-ticker trade caps
     
     await send_ntfy_alert(
         title="🔔 Market Open: Trading Desk V2 Active",
-        message="Engine activated at 09:25 ET. Monitoring 1m candle buffers for opening setups.",
+        message="Engine activated at 09:25 ET. Trade counters, P&L, and 1m buffers reset for the session.",
         priority=4
     )
 

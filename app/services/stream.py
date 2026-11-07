@@ -44,21 +44,59 @@ def get_current_session_phase() -> str:
     if 4 * 60 <= time_mins < 9 * 60 + 30:
         return "PRE_MARKET"
     elif 9 * 60 + 30 <= time_mins < 10 * 60:
-        return "RTH_OPEN"
-    elif 10 * 60 <= time_mins < 15 * 60 + 45:
-        return "RTH_NORMAL"
+        return "RTH_OPEN"          # 09:30 - 10:00 (Prime Morning Momentum)
+    elif 10 * 60 <= time_mins < 11 * 60 + 45:
+        return "RTH_NORMAL"        # 10:00 - 11:45 (Institutional Trend Continuation)
+    elif 11 * 60 + 45 <= time_mins < 14 * 60 + 15:
+        return "RTH_MIDDAY"        # 11:45 - 14:15 (MIDDAY CHOP DEAD ZONE - NO ENTRIES)
+    elif 14 * 60 + 15 <= time_mins < 15 * 60 + 45:
+        return "RTH_NORMAL"        # 14:15 - 15:45 (Afternoon Reversals & Close Squeeze)
     elif 15 * 60 + 45 <= time_mins < 16 * 60:
-        return "RTH_EOD_CLOSING"
+        return "RTH_EOD_CLOSING"   # 15:45 - 16:00 (Mandatory Liquidation Phase)
     elif 16 * 60 <= time_mins < 20 * 60:
         return "POST_MARKET"
     else:
         return "CLOSED"
 
 
+def update_macro_regime_bias():
+    """Determines general market direction based on SPY and QQQ relative to VWAP."""
+    spy_analysis = system_state.technical_analysis.get("SPY", {})
+    qqq_analysis = system_state.technical_analysis.get("QQQ", {})
+
+    spy_metrics = spy_analysis.get("metrics", {})
+    qqq_metrics = qqq_analysis.get("metrics", {})
+
+    spy_p = spy_metrics.get("last_price")
+    spy_v = spy_metrics.get("vwap")
+    qqq_p = qqq_metrics.get("last_price")
+    qqq_v = qqq_metrics.get("vwap")
+
+    bull_score = 0
+    bear_score = 0
+
+    if spy_p and spy_v:
+        if spy_p > spy_v:
+            bull_score += 1
+        elif spy_p < spy_v:
+            bear_score += 1
+
+    if qqq_p and qqq_v:
+        if qqq_p > qqq_v:
+            bull_score += 1
+        elif qqq_p < qqq_v:
+            bear_score += 1
+
+    if bull_score == 2:
+        system_state.macro_bias = "BULLISH"
+    elif bear_score == 2:
+        system_state.macro_bias = "BEARISH"
+    else:
+        system_state.macro_bias = "NEUTRAL"
+
+
 def _fetch_batched_intraday(tickers: List[str]) -> Dict[str, pd.DataFrame]:
-    """
-    Downloads 1-minute bars for all watchlist tickers in a single HTTP request.
-    """
+    """Downloads 1-minute bars for all watchlist tickers in a single HTTP request."""
     if not tickers:
         return {}
 
@@ -75,7 +113,6 @@ def _fetch_batched_intraday(tickers: List[str]) -> Dict[str, pd.DataFrame]:
     )
 
     if df is None or df.empty:
-        logger.info(f"Batched 1d download empty for [{ticker_str}]. Falling back to 5d history.")
         df = yf.download(
             tickers=ticker_str,
             period="5d",
@@ -126,16 +163,16 @@ async def fetch_single_ticker_data(ticker: str):
             last_bar = buffer_manager.get_latest_bar(ticker, interval="1m")
             if last_bar:
                 system_state.latest_quotes[ticker] = {
-                    "price": last_bar["close"],
-                    "high": last_bar["high"],
-                    "low": last_bar["low"],
-                    "volume": last_bar["volume"],
+                    "price": float(last_bar["close"]),
+                    "high": float(last_bar["high"]),
+                    "low": float(last_bar["low"]),
+                    "volume": float(last_bar["volume"]),
                     "timestamp": last_bar["timestamp"]
                 }
             buffer_df = buffer_manager.get_dataframe(ticker, interval="1m")
             analysis = evaluate_intraday_technical_snapshot(buffer_df)
             system_state.technical_analysis[ticker] = analysis
-            logger.info(f"Successfully initialized buffer and indicators for new ticker {ticker}")
+            logger.info(f"Initialized buffer and indicators for {ticker}")
             return True
     except Exception as e:
         logger.error(f"Failed to fetch initial data for {ticker}: {e}")
@@ -143,7 +180,7 @@ async def fetch_single_ticker_data(ticker: str):
 
 
 async def sync_market_data():
-    """Fetches intraday bars in a single batched call, updates buffers, evaluates setups, and manages execution."""
+    """Batched data fetch, macro regime update, risk monitoring, and gated execution."""
     active_tickers = list(system_state.active_tickers)
     if not active_tickers:
         return
@@ -160,9 +197,9 @@ async def sync_market_data():
                     real_price = float(last_bar["close"])
                     system_state.latest_quotes[ticker] = {
                         "price": real_price,
-                        "high": last_bar["high"],
-                        "low": last_bar["low"],
-                        "volume": last_bar["volume"],
+                        "high": float(last_bar["high"]),
+                        "low": float(last_bar["low"]),
+                        "volume": float(last_bar["volume"]),
                         "timestamp": last_bar["timestamp"]
                     }
 
@@ -170,60 +207,83 @@ async def sync_market_data():
                     analysis = evaluate_intraday_technical_snapshot(buffer_df)
                     system_state.technical_analysis[ticker] = analysis
 
-                    # Evaluate Gemini and execute during active trading phases
-                    if system_state.is_active and system_state.session_phase in ("RTH_OPEN", "RTH_NORMAL"):
-                        if analysis.get("signal") not in ("NEUTRAL", None):
-                            decision = await evaluate_intraday_opportunity(
-                                ticker=ticker,
-                                session_phase=system_state.session_phase,
-                                technical_analysis=analysis
-                            )
-                            system_state.agent_evaluations[ticker] = {
-                                "timestamp": datetime.utcnow().isoformat(),
-                                "decision": decision
-                            }
+        # Update macro index bias across SPY & QQQ
+        update_macro_regime_bias()
 
-                            action = decision.get("action")
-                            confidence = decision.get("confidence", 0)
-                            
-                            if action in ("BUY", "SELL") and confidence >= 75 and ticker not in system_state.open_positions:
-                                metrics = analysis.get("metrics", {})
-                                raw_atr = metrics.get("atr_14")
-                                atr = float(raw_atr) if raw_atr and raw_atr > 0 else max(0.5, real_price * 0.003)
+        # Trade Evaluation: Gated strictly to active sessions and OUTSIDE the midday chop zone
+        if system_state.is_active and system_state.session_phase in ("RTH_OPEN", "RTH_NORMAL"):
+            for ticker in active_tickers:
+                analysis = system_state.technical_analysis.get(ticker, {})
+                signal = analysis.get("signal", "NEUTRAL")
 
-                                raw_sl = decision.get("stop_loss")
-                                raw_tp = decision.get("take_profit")
+                # Skip tickers that are already active or lack directional signals
+                if signal in ("NEUTRAL", None) or ticker in system_state.open_positions:
+                    continue
 
-                                # Sanitize and enforce realistic volatility stops anchored to actual market price
-                                if action == "BUY":
-                                    if not raw_sl or raw_sl >= real_price or (real_price - raw_sl) < (0.5 * atr):
-                                        stop_loss = round(real_price - (1.5 * atr), 2)
-                                    else:
-                                        stop_loss = round(float(raw_sl), 2)
+                decision = await evaluate_intraday_opportunity(
+                    ticker=ticker,
+                    session_phase=system_state.session_phase,
+                    technical_analysis=analysis
+                )
+                system_state.agent_evaluations[ticker] = {
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "decision": decision
+                }
 
-                                    if not raw_tp or raw_tp <= real_price:
-                                        take_profit = round(real_price + (2.5 * atr), 2)
-                                    else:
-                                        take_profit = round(float(raw_tp), 2)
-                                else:  # SELL / SHORT
-                                    if not raw_sl or raw_sl <= real_price or (raw_sl - real_price) < (0.5 * atr):
-                                        stop_loss = round(real_price + (1.5 * atr), 2)
-                                    else:
-                                        stop_loss = round(float(raw_sl), 2)
+                action = decision.get("action")
+                confidence = decision.get("confidence", 0)
 
-                                    if not raw_tp or raw_tp >= real_price:
-                                        take_profit = round(real_price - (2.5 * atr), 2)
-                                    else:
-                                        take_profit = round(float(raw_tp), 2)
+                # Macro Trend Gating: Disallow fighting broad market index flow
+                if action == "BUY" and system_state.macro_bias == "BEARISH":
+                    logger.info(f"Skipping BUY for {ticker}: Blocked by BEARISH macro regime.")
+                    continue
+                if action == "SELL" and system_state.macro_bias == "BULLISH":
+                    logger.info(f"Skipping SELL for {ticker}: Blocked by BULLISH macro regime.")
+                    continue
 
-                                await open_position(
-                                    ticker=ticker,
-                                    action=action,
-                                    current_price=real_price,
-                                    stop_loss=stop_loss,
-                                    take_profit=take_profit,
-                                    reasoning=decision.get("reasoning", "Algorithmic momentum entry")
-                                )
+                if action in ("BUY", "SELL") and confidence >= 78 and ticker not in system_state.open_positions:
+                    real_price = system_state.latest_quotes[ticker]["price"]
+                    metrics = analysis.get("metrics", {})
+                    raw_atr = metrics.get("atr_14")
+                    atr = float(raw_atr) if raw_atr and raw_atr > 0 else max(0.5, real_price * 0.003)
+
+                    # Dynamic stop calculation: Ensure stop distance is at least 2.2x ATR and at least 0.55% of price
+                    min_stop_distance = max(atr * 2.2, real_price * 0.0055)
+
+                    raw_sl = decision.get("stop_loss")
+                    raw_tp = decision.get("take_profit")
+
+                    if action == "BUY":
+                        if not raw_sl or raw_sl >= real_price or (real_price - raw_sl) < min_stop_distance:
+                            stop_loss = round(real_price - min_stop_distance, 2)
+                        else:
+                            stop_loss = round(float(raw_sl), 2)
+
+                        risk_dist = real_price - stop_loss
+                        if not raw_tp or raw_tp <= real_price:
+                            take_profit = round(real_price + (risk_dist * 2.0), 2)
+                        else:
+                            take_profit = round(float(raw_tp), 2)
+                    else:  # SELL / SHORT
+                        if not raw_sl or raw_sl <= real_price or (raw_sl - real_price) < min_stop_distance:
+                            stop_loss = round(real_price + min_stop_distance, 2)
+                        else:
+                            stop_loss = round(float(raw_sl), 2)
+
+                        risk_dist = stop_loss - real_price
+                        if not raw_tp or raw_tp >= real_price:
+                            take_profit = round(real_price - (risk_dist * 2.0), 2)
+                        else:
+                            take_profit = round(float(raw_tp), 2)
+
+                    await open_position(
+                        ticker=ticker,
+                        action=action,
+                        current_price=real_price,
+                        stop_loss=stop_loss,
+                        take_profit=take_profit,
+                        reasoning=decision.get("reasoning", "Macro-aligned momentum setup")
+                    )
 
         system_state.last_fetch_error = None
 
@@ -232,8 +292,10 @@ async def sync_market_data():
         logger.warning(error_msg)
         system_state.last_fetch_error = error_msg
 
+    # Always update existing open positions & check for stops/targets
     await update_open_positions_and_risk(system_state.latest_quotes)
 
+    # Mandatory EOD Liquidation 15 minutes before closing bell
     if system_state.session_phase == "RTH_EOD_CLOSING" and system_state.open_positions:
         logger.info("RTH_EOD_CLOSING reached. Flattening all intraday positions.")
         await liquidate_all_positions(reason="RTH_EOD_AUTO_CLOSE")
@@ -244,7 +306,6 @@ async def run_intraday_tick_loop():
     logger.info("Day-Trading Intraday Loop initialized.")
     init_db()
     
-    # Initial batch fetch on startup
     await sync_market_data()
 
     while True:
@@ -252,10 +313,10 @@ async def run_intraday_tick_loop():
             system_state.session_phase = get_current_session_phase()
             system_state.last_loop_timestamp = datetime.utcnow()
 
-            # Always sync market data during loop; frequency adjusts if active vs paused
             await sync_market_data()
 
-            sleep_duration = 10 if system_state.is_active else 30
+            # Tick loop runs every 10s during active trading, 30s when paused or in midday chop
+            sleep_duration = 10 if (system_state.is_active and system_state.session_phase in ("RTH_OPEN", "RTH_NORMAL")) else 30
             await asyncio.sleep(sleep_duration)
         except asyncio.CancelledError:
             logger.info("Intraday tick loop cancellation received.")

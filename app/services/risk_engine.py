@@ -9,12 +9,12 @@ from app.services.alerts import send_ntfy_alert
 
 logger = logging.getLogger("trading_desk_v2.risk")
 
-MAX_DAILY_LOSS = 250.0        # Circuit breaker
-MAX_RISK_PER_TRADE = 50.0     # Max risk budget
-MAX_POSITION_VALUE = 2500.0   # HARD CAP: Max position dollar exposure (prevents 1000-share blowups)
-COOLDOWN_MINUTES = 20         # Wait 20 mins after exiting a ticker before re-entering
+MAX_DAILY_LOSS = 250.0          # Circuit breaker ($)
+MAX_RISK_PER_TRADE = 50.0       # Max dollar risk per trade ($)
+MAX_POSITION_VALUE = 2500.0     # Max position dollar exposure ($)
+COOLDOWN_MINUTES = 30           # Wait 30 mins after exiting a ticker before re-entering
+MAX_TRADES_PER_TICKER_DAILY = 3 # Hard limit to prevent overtrading/churn
 
-# In-memory cooldown tracking: {ticker: datetime_of_last_exit}
 ticker_cooldowns: Dict[str, datetime] = {}
 
 
@@ -45,13 +45,11 @@ def init_db():
 def calculate_position_size(entry_price: float, stop_loss: float, risk_budget: float = MAX_RISK_PER_TRADE) -> int:
     """Calculates shares using risk budget AND enforces a hard maximum total dollar cap."""
     per_share_risk = abs(entry_price - stop_loss)
-    if per_share_risk <= 0.05:  # Minimum realistic stop distance
-        per_share_risk = entry_price * 0.005  # 0.5% default stop
+    min_risk = entry_price * 0.0055  # 0.55% minimum realistic risk buffer
+    if per_share_risk < min_risk:
+        per_share_risk = min_risk
 
-    # Shares based on risk budget
     risk_shares = int(risk_budget / per_share_risk)
-    
-    # Shares based on max allowable portfolio capital per position
     max_capital_shares = int(MAX_POSITION_VALUE / entry_price)
     
     final_shares = min(risk_shares, max_capital_shares)
@@ -71,32 +69,45 @@ async def check_daily_circuit_breaker() -> bool:
 
 
 async def open_position(ticker: str, action: str, current_price: float, stop_loss: float, take_profit: float, reasoning: str):
-    """Opens position using LIVE MARKET PRICE, strictly validating stop loss and cooldowns."""
+    """Opens position using LIVE MARKET PRICE, strictly validating stop loss, trade counts, and cooldowns."""
     if await check_daily_circuit_breaker():
         return False
 
     if ticker in system_state.open_positions:
         return False
 
-    # Check cooldown
+    # 1. Enforce Daily Max Trades Per Ticker Cap
+    today_trades = system_state.daily_trade_counts.get(ticker, 0)
+    if today_trades >= MAX_TRADES_PER_TICKER_DAILY:
+        logger.info(f"Skipping entry for {ticker}: Daily cap reached ({today_trades}/{MAX_TRADES_PER_TICKER_DAILY} trades today).")
+        return False
+
+    # 2. Enforce Post-Exit Cooldown
     last_exit = ticker_cooldowns.get(ticker)
     if last_exit and datetime.utcnow() - last_exit < timedelta(minutes=COOLDOWN_MINUTES):
         remaining = int((timedelta(minutes=COOLDOWN_MINUTES) - (datetime.utcnow() - last_exit)).total_seconds() / 60)
         logger.info(f"Skipping entry for {ticker}: In cooldown for {remaining} more mins.")
         return False
 
-    # Validate Stop Loss orientation
-    if action == "BUY" and stop_loss >= current_price:
-        stop_loss = round(current_price * 0.992, 2)  # Default 0.8% stop below price
-    elif action == "SELL" and stop_loss <= current_price:
-        stop_loss = round(current_price * 1.008, 2)  # Default 0.8% stop above price
+    # 3. Enforce Minimum Stop Loss Distance (Minimum 0.55% to breathe past 1m noise)
+    min_dist = round(current_price * 0.0055, 2)
+    if action == "BUY":
+        if stop_loss >= current_price or (current_price - stop_loss) < min_dist:
+            stop_loss = round(current_price - min_dist, 2)
+        if take_profit <= current_price:
+            take_profit = round(current_price + (min_dist * 2.0), 2)
+    elif action == "SELL":
+        if stop_loss <= current_price or (stop_loss - current_price) < min_dist:
+            stop_loss = round(current_price + min_dist, 2)
+        if take_profit >= current_price:
+            take_profit = round(current_price - (min_dist * 2.0), 2)
 
     shares = calculate_position_size(current_price, stop_loss)
     position = {
         "ticker": ticker,
         "action": action,
         "shares": shares,
-        "entry_price": current_price,  # FORCED to real-time quote, never LLM hallucination
+        "entry_price": current_price,
         "current_price": current_price,
         "stop_loss": stop_loss,
         "take_profit": take_profit,
@@ -106,7 +117,9 @@ async def open_position(ticker: str, action: str, current_price: float, stop_los
     }
 
     system_state.open_positions[ticker] = position
-    alert_msg = f"{action} {shares} shares @ ${current_price:.2f} (Total: ${shares*current_price:.2f}) | SL: ${stop_loss:.2f} | TP: ${take_profit:.2f}\n{reasoning}"
+    system_state.daily_trade_counts[ticker] = today_trades + 1
+
+    alert_msg = f"{action} {shares} shares @ ${current_price:.2f} (Cap: ${shares*current_price:.2f}) | SL: ${stop_loss:.2f} | TP: ${take_profit:.2f}\nTrade #{today_trades + 1} today. Thesis: {reasoning}"
     logger.info(f"Position Opened: {ticker} {alert_msg}")
     await send_ntfy_alert(f"V2 ORDER EXECUTED: {action} {ticker}", alert_msg, priority=4)
     return True
@@ -117,7 +130,7 @@ async def close_position(ticker: str, exit_price: float, exit_reason: str):
     if not position:
         return
 
-    # Set cooldown
+    # Trigger cooldown timer immediately upon exit
     ticker_cooldowns[ticker] = datetime.utcnow()
 
     shares = position["shares"]

@@ -4,6 +4,7 @@ from typing import Dict, Any, Optional
 import httpx
 
 from app.config import settings
+from app.core.state import system_state
 
 logger = logging.getLogger("trading_desk_v2.gemini")
 
@@ -13,13 +14,14 @@ MODEL_NAME = getattr(settings, "GEMINI_MODEL", "gemini-flash-latest")
 SYSTEM_INSTRUCTION = """You are an institutional intraday momentum trader and execution agent.
 Your objective is to evaluate real-time technical indicators, VWAP positioning, Opening Range Breakout (ORB) levels, and momentum metrics to issue precise day-trading decisions.
 
-Rules:
-1. Trade Types: Intraday Scalp / Day Trade only. Never suggest holding overnight.
-2. Long Entries: Price must be above VWAP or demonstrating confirmed mean-reversion at support.
-3. Short Entries: Price must be below VWAP or breaking down through key support.
-4. Risk-Reward Ratio: Minimum target reward must be at least 1.5x the risk distance (Entry to Stop Loss).
-5. Stop Loss: Anchor stops strictly around technical invalidation levels (e.g., VWAP cross, recent swing high/low, or 1.5x ATR).
-6. Response Format: Output strictly a valid raw JSON object matching the requested schema. No conversational preamble, explanation, or markdown fences.
+Strict Rules:
+1. Trade Types: Intraday Scalp / Momentum Day Trade only. Never suggest holding overnight.
+2. Market Trend Alignment: Do NOT recommend BUY if Broad Market Macro Bias is BEARISH. Do NOT recommend SELL/SHORT if Broad Market Macro Bias is BULLISH.
+3. Long Entries: Price must be above VWAP AND fast EMA (9) must be >= slow EMA (21).
+4. Short Entries: Price must be below VWAP AND fast EMA (9) must be <= slow EMA (21).
+5. Risk-Reward Ratio: Minimum target reward must be at least 1.8x the risk distance.
+6. Stop Loss: Set stops beyond market noise. Stop distance must be AT LEAST 2.0x ATR from entry price. Never set stops closer than 0.5% of stock price.
+7. Output: Output strictly a valid raw JSON object matching the requested schema. No conversational preamble, explanation, or markdown fences.
 """
 
 
@@ -29,7 +31,7 @@ async def evaluate_intraday_opportunity(
     technical_analysis: Dict[str, Any]
 ) -> Dict[str, Any]:
     """
-    Asynchronously queries the active Gemini Flash model to evaluate an intraday setup.
+    Asynchronously queries Gemini Flash to evaluate an intraday setup.
     """
     if not settings.GEMINI_API_KEY:
         logger.warning("GEMINI_API_KEY is not configured. Defaulting to HOLD.")
@@ -58,16 +60,21 @@ async def evaluate_intraday_opportunity(
             "reasoning": "Missing price data for technical evaluation."
         }
 
+    macro_bias = getattr(system_state, "macro_bias", "NEUTRAL")
+    atr_val = metrics.get("atr_14", 1.0) or 1.0
+
     user_prompt = f"""Evaluate day trading opportunity for ticker: {ticker}
 Market Session Phase: {session_phase}
-Current Indicator Snapshot:
-- Last Price: {metrics.get('last_price')}
+Broad Market Macro Bias (SPY/QQQ): {macro_bias}
+
+Current Ticker Indicators:
+- Current Live Price: {last_price}
 - VWAP: {metrics.get('vwap')}
 - Distance from VWAP: {metrics.get('dist_from_vwap_pct')}%
 - Fast EMA (9): {metrics.get('ema_9')}
 - Slow EMA (21): {metrics.get('ema_21')}
 - RSI (14): {metrics.get('rsi_14')}
-- ATR (14): {metrics.get('atr_14')}
+- ATR (14): {atr_val}
 - ORB High: {metrics.get('orb_high')}
 - ORB Low: {metrics.get('orb_low')}
 - Algorithmic Signal: {signal}
@@ -76,12 +83,12 @@ Current Indicator Snapshot:
 Required JSON schema:
 {{
   "action": "BUY" | "SELL" | "HOLD",
-  "confidence": 75,
-  "entry_price": 734.25,
-  "stop_loss": 732.50,
-  "take_profit": 737.50,
+  "confidence": 80,
+  "entry_price": {last_price},
+  "stop_loss": <numeric price at least 2.0x ATR from entry>,
+  "take_profit": <numeric price target with >= 1.8x risk-reward>,
   "risk_reward_ratio": 1.85,
-  "reasoning": "1 to 2 sentences explaining key conviction"
+  "reasoning": "1 to 2 sentences explaining key conviction and confluence"
 }}
 Return ONLY raw JSON."""
 
@@ -118,7 +125,6 @@ Return ONLY raw JSON."""
             result_data = response.json()
             raw_text = result_data["candidates"][0]["content"]["parts"][0]["text"].strip()
             
-            # Strip markdown formatting if returned
             if raw_text.startswith("```json"):
                 raw_text = raw_text[7:]
             if raw_text.startswith("```"):
@@ -127,6 +133,8 @@ Return ONLY raw JSON."""
                 raw_text = raw_text[:-3]
 
             parsed_decision = json.loads(raw_text.strip())
+            # Force entry_price to the real live price regardless of LLM output
+            parsed_decision["entry_price"] = last_price
             return parsed_decision
 
     except Exception as e:

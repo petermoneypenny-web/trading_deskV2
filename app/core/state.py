@@ -6,7 +6,7 @@ from datetime import datetime
 @dataclass
 class MarketSessionState:
     is_active: bool = False
-    session_phase: str = "CLOSED"  # PRE_MARKET, RTH_OPEN, RTH_NORMAL, POST_MARKET, CLOSED
+    session_phase: str = "CLOSED"  # PRE_MARKET, RTH_OPEN, RTH_NORMAL, RTH_MIDDAY, RTH_EOD_CLOSING, POST_MARKET, CLOSED
     active_tickers: List[str] = field(default_factory=lambda: ["SPY", "QQQ", "AAPL", "NVDA"])
     latest_quotes: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     technical_analysis: Dict[str, Dict[str, Any]] = field(default_factory=dict)
@@ -16,6 +16,8 @@ class MarketSessionState:
     daily_unrealized_pnl: float = 0.0
     last_loop_timestamp: Optional[datetime] = None
     last_fetch_error: Optional[str] = None
+    macro_bias: str = "NEUTRAL"  # BULLISH, BEARISH, NEUTRAL (derived from SPY / QQQ)
+    daily_trade_counts: Dict[str, int] = field(default_factory=dict)  # {ticker: count_today}
 
 
 system_state = MarketSessionState()
