@@ -32,9 +32,21 @@ from app.config import settings
 
 logger = logging.getLogger("trading_desk_v2.stream")
 
+# In-memory tracking for consecutive bar signal persistence: {ticker: {"signal": str, "bars": int}}
+consecutive_signals: Dict[str, Dict[str, Any]] = {}
+
 
 def get_current_session_phase() -> str:
-    """Calculates US market session phase based on Eastern Time."""
+    """
+    Calculates US market session phase based on Eastern Time.
+    Gating:
+    - 09:30 - 10:15: RTH_OPENING_FLUSH (Opening volatility noise - DO NOT ENTER)
+    - 10:15 - 11:30: RTH_PRIME_MORNING (High conviction trend window)
+    - 11:30 - 14:15: RTH_MIDDAY (Midday chop dead zone)
+    - 14:15 - 15:30: RTH_PRIME_AFTERNOON (Afternoon trend continuation & squeeze)
+    - 15:30 - 15:45: RTH_NORMAL (No new entries)
+    - 15:45 - 16:00: RTH_EOD_CLOSING (Flatten all positions)
+    """
     now_et = datetime.now(ZoneInfo("America/New_York"))
     if now_et.weekday() >= 5:
         return "CLOSED_WEEKEND"
@@ -43,16 +55,18 @@ def get_current_session_phase() -> str:
 
     if 4 * 60 <= time_mins < 9 * 60 + 30:
         return "PRE_MARKET"
-    elif 9 * 60 + 30 <= time_mins < 10 * 60:
-        return "RTH_OPEN"          # 09:30 - 10:00 (Prime Morning Momentum)
-    elif 10 * 60 <= time_mins < 11 * 60 + 45:
-        return "RTH_NORMAL"        # 10:00 - 11:45 (Institutional Trend Continuation)
-    elif 11 * 60 + 45 <= time_mins < 14 * 60 + 15:
-        return "RTH_MIDDAY"        # 11:45 - 14:15 (MIDDAY CHOP DEAD ZONE - NO ENTRIES)
-    elif 14 * 60 + 15 <= time_mins < 15 * 60 + 45:
-        return "RTH_NORMAL"        # 14:15 - 15:45 (Afternoon Reversals & Close Squeeze)
+    elif 9 * 60 + 30 <= time_mins < 10 * 60 + 15:
+        return "RTH_OPENING_FLUSH"  # 09:30 - 10:15 ET: Let opening range wicks settle
+    elif 10 * 60 + 15 <= time_mins < 11 * 60 + 30:
+        return "RTH_PRIME_MORNING"   # 10:15 - 11:30 ET: Primary morning trend window
+    elif 11 * 60 + 30 <= time_mins < 14 * 60 + 15:
+        return "RTH_MIDDAY"          # 11:30 - 14:15 ET: Midday chop filter
+    elif 14 * 60 + 15 <= time_mins < 15 * 60 + 30:
+        return "RTH_PRIME_AFTERNOON" # 14:15 - 15:30 ET: Afternoon power hour
+    elif 15 * 60 + 30 <= time_mins < 15 * 60 + 45:
+        return "RTH_NORMAL"
     elif 15 * 60 + 45 <= time_mins < 16 * 60:
-        return "RTH_EOD_CLOSING"   # 15:45 - 16:00 (Mandatory Liquidation Phase)
+        return "RTH_EOD_CLOSING"     # 15:45 - 16:00 ET: Auto-liquidate open trades
     elif 16 * 60 <= time_mins < 20 * 60:
         return "POST_MARKET"
     else:
@@ -60,7 +74,7 @@ def get_current_session_phase() -> str:
 
 
 def update_macro_regime_bias():
-    """Determines general market direction based on SPY and QQQ relative to VWAP."""
+    """Determines broad index trend alignment using SPY & QQQ relative to VWAP."""
     spy_analysis = system_state.technical_analysis.get("SPY", {})
     qqq_analysis = system_state.technical_analysis.get("QQQ", {})
 
@@ -72,20 +86,8 @@ def update_macro_regime_bias():
     qqq_p = qqq_metrics.get("last_price")
     qqq_v = qqq_metrics.get("vwap")
 
-    bull_score = 0
-    bear_score = 0
-
-    if spy_p and spy_v:
-        if spy_p > spy_v:
-            bull_score += 1
-        elif spy_p < spy_v:
-            bear_score += 1
-
-    if qqq_p and qqq_v:
-        if qqq_p > qqq_v:
-            bull_score += 1
-        elif qqq_p < qqq_v:
-            bear_score += 1
+    bull_score = (1 if spy_p and spy_v and spy_p > spy_v else 0) + (1 if qqq_p and qqq_v and qqq_p > qqq_v else 0)
+    bear_score = (1 if spy_p and spy_v and spy_p < spy_v else 0) + (1 if qqq_p and qqq_v and qqq_p < qqq_v else 0)
 
     if bull_score == 2:
         system_state.macro_bias = "BULLISH"
@@ -93,6 +95,22 @@ def update_macro_regime_bias():
         system_state.macro_bias = "BEARISH"
     else:
         system_state.macro_bias = "NEUTRAL"
+
+
+def get_portfolio_active_direction() -> str:
+    """
+    Checks open positions to enforce portfolio-wide directional consistency.
+    Returns: 'LONG_ONLY', 'SHORT_ONLY', or 'ANY'
+    """
+    if not system_state.open_positions:
+        return "ANY"
+
+    actions = {pos["action"] for pos in system_state.open_positions.values()}
+    if "BUY" in actions and "SELL" not in actions:
+        return "LONG_ONLY"
+    elif "SELL" in actions and "BUY" not in actions:
+        return "SHORT_ONLY"
+    return "ANY"
 
 
 def _fetch_batched_intraday(tickers: List[str]) -> Dict[str, pd.DataFrame]:
@@ -210,14 +228,28 @@ async def sync_market_data():
         # Update macro index bias across SPY & QQQ
         update_macro_regime_bias()
 
-        # Trade Evaluation: Gated strictly to active sessions and OUTSIDE the midday chop zone
-        if system_state.is_active and system_state.session_phase in ("RTH_OPEN", "RTH_NORMAL"):
+        # Trade Evaluation: Strictly gated to prime trading windows outside opening flush and midday chop
+        if system_state.is_active and system_state.session_phase in ("RTH_PRIME_MORNING", "RTH_PRIME_AFTERNOON"):
+            portfolio_direction = get_portfolio_active_direction()
+
             for ticker in active_tickers:
                 analysis = system_state.technical_analysis.get(ticker, {})
                 signal = analysis.get("signal", "NEUTRAL")
 
-                # Skip tickers that are already active or lack directional signals
+                # Track consecutive bar signal persistence (require 2 consecutive bars)
+                tracker = consecutive_signals.get(ticker, {"signal": "NEUTRAL", "bars": 0})
+                if signal != "NEUTRAL" and signal == tracker["signal"]:
+                    tracker["bars"] += 1
+                else:
+                    tracker = {"signal": signal, "bars": 1 if signal != "NEUTRAL" else 0}
+                consecutive_signals[ticker] = tracker
+
                 if signal in ("NEUTRAL", None) or ticker in system_state.open_positions:
+                    continue
+
+                # Enforce 2 consecutive bar confirmation
+                if tracker["bars"] < 2:
+                    logger.info(f"Awaiting 2-bar confirmation for {ticker} ({signal} bar {tracker['bars']}/2)")
                     continue
 
                 decision = await evaluate_intraday_opportunity(
@@ -233,12 +265,20 @@ async def sync_market_data():
                 action = decision.get("action")
                 confidence = decision.get("confidence", 0)
 
-                # Macro Trend Gating: Disallow fighting broad market index flow
+                # 1. Macro Trend Gating
                 if action == "BUY" and system_state.macro_bias == "BEARISH":
                     logger.info(f"Skipping BUY for {ticker}: Blocked by BEARISH macro regime.")
                     continue
                 if action == "SELL" and system_state.macro_bias == "BULLISH":
                     logger.info(f"Skipping SELL for {ticker}: Blocked by BULLISH macro regime.")
+                    continue
+
+                # 2. Portfolio Directional Lock
+                if action == "BUY" and portfolio_direction == "SHORT_ONLY":
+                    logger.info(f"Skipping BUY for {ticker}: Portfolio locked to SHORT_ONLY while short positions are open.")
+                    continue
+                if action == "SELL" and portfolio_direction == "LONG_ONLY":
+                    logger.info(f"Skipping SELL for {ticker}: Portfolio locked to LONG_ONLY while long positions are open.")
                     continue
 
                 if action in ("BUY", "SELL") and confidence >= 78 and ticker not in system_state.open_positions:
@@ -247,9 +287,8 @@ async def sync_market_data():
                     raw_atr = metrics.get("atr_14")
                     atr = float(raw_atr) if raw_atr and raw_atr > 0 else max(0.5, real_price * 0.003)
 
-                    # Dynamic stop calculation: Ensure stop distance is at least 2.2x ATR and at least 0.55% of price
+                    # Dynamic volatility stops: >= 2.2x ATR or >= 0.55% of stock price
                     min_stop_distance = max(atr * 2.2, real_price * 0.0055)
-
                     raw_sl = decision.get("stop_loss")
                     raw_tp = decision.get("take_profit")
 
@@ -282,7 +321,7 @@ async def sync_market_data():
                         current_price=real_price,
                         stop_loss=stop_loss,
                         take_profit=take_profit,
-                        reasoning=decision.get("reasoning", "Macro-aligned momentum setup")
+                        reasoning=decision.get("reasoning", "Confirmed 2-bar momentum setup")
                     )
 
         system_state.last_fetch_error = None
@@ -292,10 +331,8 @@ async def sync_market_data():
         logger.warning(error_msg)
         system_state.last_fetch_error = error_msg
 
-    # Always update existing open positions & check for stops/targets
     await update_open_positions_and_risk(system_state.latest_quotes)
 
-    # Mandatory EOD Liquidation 15 minutes before closing bell
     if system_state.session_phase == "RTH_EOD_CLOSING" and system_state.open_positions:
         logger.info("RTH_EOD_CLOSING reached. Flattening all intraday positions.")
         await liquidate_all_positions(reason="RTH_EOD_AUTO_CLOSE")
@@ -315,8 +352,9 @@ async def run_intraday_tick_loop():
 
             await sync_market_data()
 
-            # Tick loop runs every 10s during active trading, 30s when paused or in midday chop
-            sleep_duration = 10 if (system_state.is_active and system_state.session_phase in ("RTH_OPEN", "RTH_NORMAL")) else 30
+            # Tick loop runs every 10s during prime trading, 30s during opening flush, midday chop, or paused
+            is_prime = system_state.session_phase in ("RTH_PRIME_MORNING", "RTH_PRIME_AFTERNOON")
+            sleep_duration = 10 if (system_state.is_active and is_prime) else 30
             await asyncio.sleep(sleep_duration)
         except asyncio.CancelledError:
             logger.info("Intraday tick loop cancellation received.")
