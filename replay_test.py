@@ -40,14 +40,14 @@ def get_mock_session_phase(bar_time) -> str:
 
     time_mins = et_time.hour * 60 + et_time.minute
 
-    if 9 * 60 + 30 <= time_mins < 10 * 60 + 15:
-        return "RTH_OPENING_FLUSH"  # 09:30 - 10:15 ET: Skip opening noise
-    elif 10 * 60 + 15 <= time_mins < 11 * 60 + 30:
-        return "RTH_PRIME_MORNING"   # 10:15 - 11:30 ET: Prime morning trend
+    if 9 * 60 + 30 <= time_mins < 9 * 60 + 45:
+        return "RTH_OPENING_FLUSH"  # 09:30 - 09:45 ET: Initial opening bar volatility
+    elif 9 * 60 + 45 <= time_mins < 11 * 60 + 30:
+        return "RTH_PRIME_MORNING"   # 09:45 - 11:30 ET: Prime morning trend window
     elif 11 * 60 + 30 <= time_mins < 14 * 60 + 15:
         return "RTH_MIDDAY"          # 11:30 - 14:15 ET: Midday dead zone
     elif 14 * 60 + 15 <= time_mins < 15 * 60 + 30:
-        return "RTH_PRIME_AFTERNOON" # 14:15 - 15:30 ET: Afternoon squeeze
+        return "RTH_PRIME_AFTERNOON" # 14:15 - 15:30 ET: Afternoon squeeze window
     elif 15 * 60 + 30 <= time_mins < 15 * 60 + 45:
         return "RTH_NORMAL"
     elif 15 * 60 + 45 <= time_mins < 16 * 60:
@@ -77,19 +77,8 @@ def update_macro_regime_bias():
         system_state.macro_bias = "NEUTRAL"
 
 
-def get_portfolio_active_direction() -> str:
-    if not system_state.open_positions:
-        return "ANY"
-    actions = {pos["action"] for pos in system_state.open_positions.values()}
-    if "BUY" in actions and "SELL" not in actions:
-        return "LONG_ONLY"
-    elif "SELL" in actions and "BUY" not in actions:
-        return "SHORT_ONLY"
-    return "ANY"
-
-
 async def run_replay(target_date_str: str = None):
-    logger.info("Initializing hardened market data replay test harness...")
+    logger.info("Initializing pullback-optimized replay test...")
     init_db()
 
     system_state.is_active = True
@@ -154,7 +143,6 @@ async def run_replay(target_date_str: str = None):
     blocked_by_macro = 0
     blocked_by_midday = 0
     blocked_by_opening_flush = 0
-    blocked_by_direction_lock = 0
     blocked_by_confirmation = 0
     signal_counts = {}
     consecutive_signals = {}
@@ -197,13 +185,10 @@ async def run_replay(target_date_str: str = None):
             await liquidate_all_positions(reason="RTH_EOD_AUTO_CLOSE")
             continue
 
-        portfolio_direction = get_portfolio_active_direction()
-
         for ticker in TICKERS:
             analysis = system_state.technical_analysis.get(ticker, {})
             sig = analysis.get("signal", "NEUTRAL")
 
-            # Consecutive signal tracking
             tracker = consecutive_signals.get(ticker, {"signal": "NEUTRAL", "bars": 0})
             if sig not in ("NEUTRAL", None) and sig == tracker["signal"]:
                 tracker["bars"] += 1
@@ -214,38 +199,27 @@ async def run_replay(target_date_str: str = None):
             if sig not in ("NEUTRAL", None):
                 signal_counts[sig] = signal_counts.get(sig, 0) + 1
 
-                # 1. Opening Flush Block (09:30 - 10:15 ET)
                 if session_phase == "RTH_OPENING_FLUSH":
                     blocked_by_opening_flush += 1
                     continue
 
-                # 2. Midday Dead Zone Block (11:30 - 14:15 ET)
                 if session_phase == "RTH_MIDDAY":
                     blocked_by_midday += 1
                     continue
 
                 if session_phase in ("RTH_PRIME_MORNING", "RTH_PRIME_AFTERNOON") and ticker not in system_state.open_positions:
-                    # 3. Consecutive Bar Signal Confirmation
                     if tracker["bars"] < 2:
                         blocked_by_confirmation += 1
                         continue
 
                     action = "BUY" if "BULLISH" in sig or "LONG" in sig else "SELL"
 
-                    # 4. Macro Filter Check
+                    # Macro Filter: disallow BUY if market is completely BEARISH, disallow SELL if completely BULLISH
                     if action == "BUY" and system_state.macro_bias == "BEARISH":
                         blocked_by_macro += 1
                         continue
                     if action == "SELL" and system_state.macro_bias == "BULLISH":
                         blocked_by_macro += 1
-                        continue
-
-                    # 5. Portfolio Direction Lock
-                    if action == "BUY" and portfolio_direction == "SHORT_ONLY":
-                        blocked_by_direction_lock += 1
-                        continue
-                    if action == "SELL" and portfolio_direction == "LONG_ONLY":
-                        blocked_by_direction_lock += 1
                         continue
 
                     real_price = system_state.latest_quotes[ticker]["price"]
@@ -266,7 +240,7 @@ async def run_replay(target_date_str: str = None):
                         current_price=real_price,
                         stop_loss=stop_loss,
                         take_profit=take_profit,
-                        reasoning=f"Confirmed 2-bar setup: {sig} (Macro: {system_state.macro_bias})"
+                        reasoning=f"Pullback confirmed: {sig} (Macro: {system_state.macro_bias})"
                     )
                     if opened:
                         trades_opened += 1
@@ -276,11 +250,10 @@ async def run_replay(target_date_str: str = None):
     logger.info(f"REPLAY BACKTEST COMPLETED FOR: {target_date}")
     logger.info("=" * 60)
     logger.info(f"Total Technical Signals Detected: {signal_counts}")
-    logger.info(f"Entries Blocked by 09:30-10:15 Opening Flush: {blocked_by_opening_flush}")
+    logger.info(f"Entries Blocked by 09:30-09:45 Opening Flush: {blocked_by_opening_flush}")
     logger.info(f"Entries Blocked by 11:30-14:15 Midday Chop: {blocked_by_midday}")
     logger.info(f"Entries Blocked by Macro Bias Filter: {blocked_by_macro}")
-    logger.info(f"Entries Blocked by Portfolio Direction Lock: {blocked_by_direction_lock}")
-    logger.info(f"Entries Blocked by 2-Bar Confirmation Filter: {blocked_by_confirmation}")
+    logger.info(f"Entries Blocked by 2-Bar Confirmation: {blocked_by_confirmation}")
     logger.info(f"Total Trades Opened: {trades_opened}")
     logger.info(f"Final Realized P&L: ${system_state.daily_realized_pnl:+.2f}")
     logger.info("=" * 60)
