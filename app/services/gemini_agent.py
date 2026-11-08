@@ -12,10 +12,13 @@ logger = logging.getLogger("trading_desk_v2.gemini")
 BASE_GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models"
 MODEL_NAME = getattr(settings, "GEMINI_MODEL", "gemini-flash-latest")
 
-# The old client used a 12s timeout, which is longer than the 10s tick interval
-# and was awaited inline, freezing risk monitoring. Callers now wrap this in
-# their own, shorter deadline and never block the risk loop on it.
-HTTP_TIMEOUT_SECONDS = 6.0
+# Measured latency for this model/prompt on a typical connection is 6-11s, so the
+# original 12s client timeout was already marginal. 20s is safe headroom.
+# Override with GEMINI_HTTP_TIMEOUT in the environment.
+# NOTE: this is NOT what protects the trading loop any more -- the caller applies
+# LLM_DEADLINE_SECONDS via asyncio.wait_for, and the call runs in a background
+# task, so position monitoring continues regardless.
+HTTP_TIMEOUT_SECONDS = float(getattr(settings, "GEMINI_HTTP_TIMEOUT", 20.0))
 
 SYSTEM_INSTRUCTION = """You are an institutional intraday momentum trader and execution agent.
 Your objective is to evaluate real-time technical indicators, VWAP positioning, Opening Range Breakout (ORB) levels, and momentum metrics to issue precise day-trading decisions.

@@ -177,6 +177,30 @@ def calculate_dollar_volume(df: pd.DataFrame, lookback: int = 15) -> float:
     return float((window["close"].astype(float) * window["volume"].astype(float)).sum())
 
 
+def calculate_relative_volume(df: pd.DataFrame, lookback: int = 15):
+    """
+    Recent volume relative to a robust intraday baseline.
+
+    The obvious baseline -- the session-to-date mean -- is badly biased early in
+    the session, because the 09:30-09:45 opening spike dominates it. That made
+    ordinary late-morning volume read as 0.45-0.55, and the liquidity filter then
+    rejected perfectly good setups. The median of complete `lookback`-bar windows
+    is robust to a single outlier window.
+    """
+    if df.empty or "volume" not in df:
+        return None
+    vol = df["volume"].astype(float).dropna()
+    if len(vol) < lookback * 2:
+        return None  # not enough history to judge
+    n_windows = len(vol) // lookback
+    windows = vol.iloc[: n_windows * lookback].to_numpy().reshape(n_windows, lookback).mean(axis=1)
+    baseline = float(np.median(windows))
+    if baseline <= 0:
+        return None
+    recent = float(vol.tail(lookback).mean())
+    return _sanitize_float(recent / baseline, default=None)
+
+
 def score_setup(analysis: Dict[str, Any]) -> float:
     """
     Ranks competing setups so the engine can take the best 1-2 instead of every
@@ -264,11 +288,7 @@ def evaluate_intraday_technical_snapshot(df: pd.DataFrame, session_start=None) -
         atr_pct = _sanitize_float((current_atr / last_close) * 100.0, default=0.0)
 
     dollar_volume_15m = calculate_dollar_volume(df, lookback=15)
-    avg_volume_15m = float(df["volume"].astype(float).tail(15).mean()) if len(df) >= 15 else 0.0
-    session_avg_volume = float(df["volume"].astype(float).mean()) if len(df) else 0.0
-    relative_volume = None
-    if session_avg_volume > 0:
-        relative_volume = _sanitize_float(avg_volume_15m / session_avg_volume, default=0.0)
+    relative_volume = calculate_relative_volume(df, lookback=15)
 
     signal = "NEUTRAL"
     bias_score = 0

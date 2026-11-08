@@ -285,11 +285,24 @@ async def run_replay(target_date_str: str = None, use_llm: bool = False, max_llm
                 from app.services.gemini_agent import evaluate_intraday_opportunity
                 llm_calls += 1
                 logger.info(f"[{et_time.strftime('%H:%M')} ET] Gemini call {llm_calls}/{max_llm_calls} for {ticker}")
-                decision = await evaluate_intraday_opportunity(
-                    ticker=ticker,
-                    session_phase=session_phase,
-                    technical_analysis=analysis,
-                )
+                # Apply the same deadline the live engine uses, so a hung
+                # request cannot stall the backtest.
+                from app.config import settings as _settings
+                _deadline = float(getattr(_settings, "LLM_DEADLINE_SECONDS", 25.0))
+                try:
+                    decision = await asyncio.wait_for(
+                        evaluate_intraday_opportunity(
+                            ticker=ticker,
+                            session_phase=session_phase,
+                            technical_analysis=analysis,
+                        ),
+                        timeout=_deadline,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        f"Gemini timed out after {_deadline}s for {ticker}; skipping."
+                    )
+                    continue
                 llm_action = (decision.get("action") or "HOLD").upper()
                 if llm_action not in ("BUY", "SELL"):
                     logger.info(f"Gemini vetoed {ticker}: {decision.get('rejected_because') or decision.get('reasoning')}")

@@ -22,6 +22,6 @@
   "commission_per_share": 0.005,
   "slippage_pct": 0.0002,
   "dollar_volume_lookback_bars": 15,
-  "min_relative_volume": 0.8,
+  "min_relative_volume": 0.5,
   "max_trades_per_ticker_daily": 3
 }

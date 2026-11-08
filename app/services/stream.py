@@ -47,8 +47,11 @@ consecutive_signals: Dict[str, Dict[str, Any]] = {}
 _inflight_evaluations: set = set()
 
 # Hard ceiling on how long we will wait for the LLM before falling back to the
-# technical signal alone.
-LLM_TIMEOUT_SECONDS = 8.0
+# technical signal alone. This must comfortably exceed GEMINI_HTTP_TIMEOUT, or
+# the inner client timeout fires first and every call fails with ReadTimeout.
+# Because the evaluation runs in a background task, a generous deadline costs
+# nothing -- the risk loop keeps ticking every 10s regardless.
+LLM_TIMEOUT_SECONDS = float(getattr(settings, "LLM_DEADLINE_SECONDS", 25.0))
 
 
 def reset_daily_state():
