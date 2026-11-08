@@ -19,5 +19,11 @@ class MarketSessionState:
     macro_bias: str = "NEUTRAL"  # BULLISH, BEARISH, NEUTRAL (derived from SPY / QQQ)
     daily_trade_counts: Dict[str, int] = field(default_factory=dict)  # {ticker: count_today}
 
+    # --- added ------------------------------------------------------------
+    daily_trade_count: int = 0        # total trades taken today (vs per-ticker counts)
+    session_date: Optional[str] = None  # YYYY-MM-DD of the session being traded
+    entries_blocked: Dict[str, int] = field(default_factory=dict)  # reason -> count
+    last_agent_latency_ms: Optional[float] = None
+
 
 system_state = MarketSessionState()

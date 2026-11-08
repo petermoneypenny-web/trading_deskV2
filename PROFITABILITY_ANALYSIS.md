@@ -304,3 +304,145 @@ symptom; the 16.2% win rate against a 33.3% break-even is the disease.
 
 Fix the stop width, the ORB/VWAP anchoring, and the position sizing first — those
 three changes account for the majority of the loss.
+
+---
+
+# PART 2 — What was actually changed (implemented)
+
+All ten fixes from Part 1 have now been implemented on top of `master` V10
+(which already contained your pullback filter in `indicators.py`). Verified with
+35 logic checks plus an end-to-end replay run on a synthetic 3-session dataset.
+
+> **Note on the numbers:** the synthetic dataset is a random walk, so its P&L is
+> meaningless. What it proves is that the harness runs, that the simulated
+> cooldown now expires on bar time (you can watch it count down and then re-enter
+> the same ticker), and that the new summary reports exit breakdown, costs and
+> per-signal conditional statistics. **Re-run `replay_csv.py` on your real
+> `historical_1m_30d.csv` to get the real answer** — this sandbox has no access
+> to Yahoo Finance.
+
+## Files changed
+
+| File | Change |
+|---|---|
+| `app/services/risk_config.py` | **NEW** — loads `rulebook.json` into a validated, typed config |
+| `app/services/indicators.py` | Session-anchored VWAP/ORB, RSI + ATR correctness, liquidity metrics, setup scoring |
+| `app/services/risk_engine.py` | Volatility stops, honest R:R gate, fixed sizing, time/breakeven stops, cluster caps, costs, injected clock |
+| `app/services/buffer.py` | 120 → 400 bars (full session), pre-market filtering, session anchor |
+| `app/services/stream.py` | Non-blocking LLM, ranked entry selection, per-entry gates, daily reset |
+| `app/services/scheduler.py` | Full per-session state reset at market open |
+| `app/services/gemini_agent.py` | Output validation, quantified-edge requirement, real timeout |
+| `app/services/state.py` | `daily_trade_count`, `session_date`, `entries_blocked` |
+| `app/api/routes.py` | `/risk/config`, `/risk/exposure`, `/stats/session`, `/session/reset-daily` |
+| `replay_csv.py`, `replay_test.py` | Rewritten harnesses — see Fix 7 |
+| `rulebook.json` | Corrected and extended; now actually read by the code |
+
+## Fix-by-fix
+
+### Fix 1 — ORB and VWAP anchored to the session ✅
+`indicators.py` gained a `session_start` parameter threaded through
+`calculate_vwap`, `calculate_orb` and `evaluate_intraday_technical_snapshot`.
+`buffer.py` now holds **400** one-minute bars (a full RTH session) instead of
+120, and drops pre-market bars on load, so the "opening range" really is
+09:30–09:45 and VWAP really is session-anchored.
+
+### Fix 2 — Volatility-derived stop and target ✅
+`compute_stop_and_target()` is now the single source of truth:
+
+```
+stop = clamp(max(atr * 2.5, price * 0.8%), ceiling = price * 3.0%)
+target = entry ± stop * 2.5
+```
+
+The 0.55% floor is gone (raised to 0.80%), the target is a configurable 2.5R
+rather than a mechanical 2× the stop, and `open_position` now **rejects** any
+trade whose realised reward:risk falls below `min_risk_reward_ratio`.
+
+### Fix 3 — Position sizing ✅
+`calculate_position_size` now logs which cap binds, and `RiskConfig.reconcile()`
+raises `max_position_value` to at least `max_risk_per_trade / min_stop_pct` when
+it is too low to express the risk budget. Measured: risk per trade went from
+**$12.93 (26% of budget) to the full $50**. `MAX_DAILY_LOSS` was also rescaled
+from $250 (unreachable) to $120, which the per-trade caps can actually reach.
+
+### Fix 4 — Time stop and breakeven management ✅
+`_manage_position()` tracks the best favourable excursion, moves the stop to
+breakeven after +1R, and closes any trade still unresolved after
+`max_hold_minutes` (45) with `TIME_STOP` / `BREAKEVEN_STOP`. This converts the
+34% of trades that used to drift to a flat EOD close into something with an exit.
+
+### Fix 5 — Correlation clusters ✅
+New `TICKER_CLUSTERS` map (INDEX / SEMIS / MEGA_TECH). `open_position` enforces
+`max_positions_per_cluster`, and the **direction lock is now enforced inside
+`open_position`** rather than in the entry loops, so it holds on every path
+(API, manual order, replay) — previously it was computed once per bar and could
+not block same-bar entries.
+
+### Fix 6 — Fewer, better trades ✅
+`score_setup()` ranks candidates on VWAP proximity, RSI health, relative volume
+and ATR regime. Both harnesses and `stream.py` now sort candidates by score and
+take only the top N, subject to `max_trades_per_day`. Added the missing
+`min_dollar_volume` and `min_relative_volume` liquidity gates.
+
+### Fix 7 — Honest replay harness ✅
+* **Injected clock** (`set_clock`) — cooldowns run on simulated bar time, so the
+  30-minute cooldown actually expires. The old run produced 1,577 lines of
+  cooldown spam out of 2,006; the new run shows `cooldown=39` as a clean
+  histogram entry and re-enters the same ticker later in the session.
+* **Intrabar stops** — `_resolve_exit` uses the bar's high/low, not just the close.
+* **No manufactured prices** — incomplete bars are dropped from the day frame
+  instead of `ffill`/`bfill`.
+* **Costs** — commission + slippage charged on every round trip.
+* **Per-signal conditional stats** — the summary now reports stop/target/time-stop
+  counts, win rate on resolved trades, break-even win rate, expectancy, profit
+  factor, and a per-signal table.
+* **No live LLM by default** — `--llm` opts in.
+* The misleading 5-day fallback download was removed.
+
+### Fix 8 — `rulebook.json` is live ✅
+Nothing read it before. `risk_config.py` loads it, validates it, applies
+environment overrides (`RISK_MAX_DAILY_LOSS=...`), and `GET /api/risk/config`
+shows exactly what is in force. Two keys were corrected: `atr_stop_multiplier`
+1.8 → 2.5 (1.8 was *tighter* than the 2.2 the code actually used) and
+`max_stop_distance_multiplier` → `max_stop_distance_pct` (an ATR-multiple ceiling
+can never bind when the floor is also an ATR multiple).
+
+### Fix 9 — LLM demoted ✅
+Gemini now runs as a **background task** with an 8s deadline, so it can never
+freeze `update_open_positions_and_risk` (previously up to ~80s per cycle with a
+7-name watchlist). Its output is validated: stop on the correct side, at least
+2.0× ATR away, reward:risk above the rulebook minimum, and a **quantified
+`edge`** field — no number, no trade. HTTP timeout reduced 12s → 6s.
+
+### Fix 10 — Correctness bugs ✅
+* `calculate_rsi` returns **100** with zero down-bars (was collapsing to 50,
+  discarding the strongest momentum reading).
+* `calculate_atr` seeds with the **mean of the first 14 true ranges** per Wilder,
+  instead of the first bar's TR, and pads the warm-up window.
+* `calculate_position_size` returns **0** rather than 1 share when the position
+  cap cannot be met, so a >$6,250 position can no longer slip through.
+* `init_db()` creates its data directory on demand.
+* `from typing import Dict, List, Any, Any` duplicate-import typo in `stream.py`.
+
+## Verification performed here
+
+* All 12 modules import cleanly.
+* **35/35 logic checks pass** — stop geometry, sizing, session-anchored VWAP/ORB,
+  RSI/ATR edge cases, injected clock, cooldown expiry, cluster cap, direction
+  lock, R:R rejection, intrabar stop, time stop, breakeven arming, cost
+  accounting, risk-score gate.
+* `replay_csv.py` runs end-to-end on a synthetic 3-session dataset and emits the
+  new summary.
+
+## What still needs your data
+
+1. **Re-run the replay on real data** and compare against the old −$75.82 /
+   16.2% win rate. The break-even win rate at the new 2.5R shape is **28.6%**
+   (was 33.3%) — but only if the wider stops actually reduce the 50% stop-out
+   rate, which is an empirical question this sandbox cannot answer.
+2. **Set `equity`** in `rulebook.json` to your real account size — every
+   percentage-based cap derives from it. $25,000 is a placeholder.
+3. **Tune `max_hold_minutes`** — 45 is a guess; the right value depends on how
+   long your setups actually take to work.
+4. **Watch the first live sessions.** The new engine will take *fewer* trades
+   (ranked, capped at 6/day, 1 per cluster) and hold them longer.

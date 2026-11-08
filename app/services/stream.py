@@ -3,7 +3,7 @@ import asyncio
 import logging
 from datetime import datetime
 from zoneinfo import ZoneInfo
-from typing import Dict, List, Any, Any
+from typing import Dict, List, Any, Optional
 import yfinance as yf
 import pandas as pd
 
@@ -19,21 +19,54 @@ except Exception:
 
 from app.core.state import system_state
 from app.services.buffer import buffer_manager
-from app.services.indicators import evaluate_intraday_technical_snapshot
+from app.services.indicators import evaluate_intraday_technical_snapshot, score_setup
 from app.services.gemini_agent import evaluate_intraday_opportunity
 from app.services.alerts import send_ntfy_alert
 from app.services.risk_engine import (
     init_db,
     open_position,
     update_open_positions_and_risk,
-    liquidate_all_positions
+    liquidate_all_positions,
+    compute_stop_and_target,
+    portfolio_direction,
+    cluster_for,
+    cluster_positions,
+    ticker_cooldowns,
 )
+from app.services.risk_config import get_risk_config
 from app.config import settings
 
 logger = logging.getLogger("trading_desk_v2.stream")
 
 # In-memory tracking for consecutive bar signal persistence: {ticker: {"signal": str, "bars": int}}
 consecutive_signals: Dict[str, Dict[str, Any]] = {}
+
+# LLM evaluations in flight. Kept as a set so the tick loop never awaits them:
+# previously the Gemini call was awaited inline, blocking position monitoring for
+# 6-11 seconds per ticker (up to ~80s per cycle with a 7-name watchlist).
+_inflight_evaluations: set = set()
+
+# Hard ceiling on how long we will wait for the LLM before falling back to the
+# technical signal alone.
+LLM_TIMEOUT_SECONDS = 8.0
+
+
+def reset_daily_state():
+    """
+    Clears per-session state. Called at market open and by the replay harness.
+
+    Previously ``consecutive_signals`` was never reset, so the last signal of the
+    previous day could carry over and satisfy the 2-bar confirmation on the very
+    first bar of a new session.
+    """
+    consecutive_signals.clear()
+    ticker_cooldowns.clear()
+    system_state.daily_trade_counts = {}
+    system_state.daily_trade_count = 0
+    system_state.entries_blocked = {}
+    buffer_manager.reset_session()
+    from app.services.risk_engine import reset_session_stats
+    reset_session_stats()
 
 
 def get_current_session_phase() -> str:
@@ -101,16 +134,17 @@ def get_portfolio_active_direction() -> str:
     """
     Checks open positions to enforce portfolio-wide directional consistency.
     Returns: 'LONG_ONLY', 'SHORT_ONLY', or 'ANY'
-    """
-    if not system_state.open_positions:
-        return "ANY"
 
-    actions = {pos["action"] for pos in system_state.open_positions.values()}
-    if "BUY" in actions and "SELL" not in actions:
-        return "LONG_ONLY"
-    elif "SELL" in actions and "BUY" not in actions:
-        return "SHORT_ONLY"
-    return "ANY"
+    NOTE: this is a point-in-time snapshot. It used to be computed once per bar
+    before the ticker loop, which made it useless -- it could not block entries
+    made later in the same bar. Callers must re-check it after each fill.
+    """
+    return portfolio_direction()
+
+
+def _blocked(ticker: str, reason: str):
+    system_state.entries_blocked[reason] = system_state.entries_blocked.get(reason, 0) + 1
+    logger.info(f"Entry blocked for {ticker}: {reason}")
 
 
 def _fetch_batched_intraday(tickers: List[str]) -> Dict[str, pd.DataFrame]:
@@ -119,7 +153,7 @@ def _fetch_batched_intraday(tickers: List[str]) -> Dict[str, pd.DataFrame]:
         return {}
 
     ticker_str = " ".join(tickers)
-    
+
     df = yf.download(
         tickers=ticker_str,
         period="1d",
@@ -130,20 +164,14 @@ def _fetch_batched_intraday(tickers: List[str]) -> Dict[str, pd.DataFrame]:
         group_by="column"
     )
 
+    # FIX: the old fallback silently re-downloaded 5 days and kept only the last
+    # 120 bars, which mixed *previous sessions* into the session VWAP, the
+    # opening range and the 2-bar confirmation count. Fail loudly instead.
     if df is None or df.empty:
-        df = yf.download(
-            tickers=ticker_str,
-            period="5d",
-            interval="1m",
-            prepost=True,
-            progress=False,
-            threads=False,
-            group_by="column"
+        logger.warning(
+            "No 1m data returned for today. Not falling back to multi-day data: "
+            "stale bars from a prior session corrupt session-scoped indicators."
         )
-        if df is not None and not df.empty:
-            df = df.tail(120)
-
-    if df is None or df.empty:
         return {}
 
     result: Dict[str, pd.DataFrame] = {}
@@ -155,7 +183,7 @@ def _fetch_batched_intraday(tickers: List[str]) -> Dict[str, pd.DataFrame]:
                 for metric in ["Open", "High", "Low", "Close", "Volume"]:
                     if (metric, ticker) in df.columns:
                         sub_df[metric] = df[(metric, ticker)]
-                
+
                 sub_df.dropna(subset=["Close"], inplace=True)
                 if not sub_df.empty:
                     result[ticker] = sub_df
@@ -188,7 +216,8 @@ async def fetch_single_ticker_data(ticker: str):
                     "timestamp": last_bar["timestamp"]
                 }
             buffer_df = buffer_manager.get_dataframe(ticker, interval="1m")
-            analysis = evaluate_intraday_technical_snapshot(buffer_df)
+            session_start = buffer_manager.get_session_start(ticker)
+            analysis = evaluate_intraday_technical_snapshot(buffer_df, session_start=session_start)
             system_state.technical_analysis[ticker] = analysis
             logger.info(f"Initialized buffer and indicators for {ticker}")
             return True
@@ -197,8 +226,21 @@ async def fetch_single_ticker_data(ticker: str):
     return False
 
 
+def _refresh_indicators(tickers: List[str]):
+    """Recomputes indicators for each ticker from its session-scoped buffer."""
+    for ticker in tickers:
+        buffer_df = buffer_manager.get_dataframe(ticker, interval="1m")
+        if buffer_df.empty:
+            continue
+        session_start = buffer_manager.get_session_start(ticker)
+        system_state.technical_analysis[ticker] = evaluate_intraday_technical_snapshot(
+            buffer_df, session_start=session_start
+        )
+
+
 async def sync_market_data():
     """Batched data fetch, macro regime update, risk monitoring, and gated execution."""
+    cfg = get_risk_config()
     active_tickers = list(system_state.active_tickers)
     if not active_tickers:
         return
@@ -221,108 +263,10 @@ async def sync_market_data():
                         "timestamp": last_bar["timestamp"]
                     }
 
-                    buffer_df = buffer_manager.get_dataframe(ticker, interval="1m")
-                    analysis = evaluate_intraday_technical_snapshot(buffer_df)
-                    system_state.technical_analysis[ticker] = analysis
+        _refresh_indicators(active_tickers)
 
         # Update macro index bias across SPY & QQQ
         update_macro_regime_bias()
-
-        # Trade Evaluation: Strictly gated to prime trading windows outside opening flush and midday chop
-        if system_state.is_active and system_state.session_phase in ("RTH_PRIME_MORNING", "RTH_PRIME_AFTERNOON"):
-            portfolio_direction = get_portfolio_active_direction()
-
-            for ticker in active_tickers:
-                analysis = system_state.technical_analysis.get(ticker, {})
-                signal = analysis.get("signal", "NEUTRAL")
-
-                # Track consecutive bar signal persistence (require 2 consecutive bars)
-                tracker = consecutive_signals.get(ticker, {"signal": "NEUTRAL", "bars": 0})
-                if signal != "NEUTRAL" and signal == tracker["signal"]:
-                    tracker["bars"] += 1
-                else:
-                    tracker = {"signal": signal, "bars": 1 if signal != "NEUTRAL" else 0}
-                consecutive_signals[ticker] = tracker
-
-                if signal in ("NEUTRAL", None) or ticker in system_state.open_positions:
-                    continue
-
-                # Enforce 2 consecutive bar confirmation
-                if tracker["bars"] < 2:
-                    logger.info(f"Awaiting 2-bar confirmation for {ticker} ({signal} bar {tracker['bars']}/2)")
-                    continue
-
-                decision = await evaluate_intraday_opportunity(
-                    ticker=ticker,
-                    session_phase=system_state.session_phase,
-                    technical_analysis=analysis
-                )
-                system_state.agent_evaluations[ticker] = {
-                    "timestamp": datetime.utcnow().isoformat(),
-                    "decision": decision
-                }
-
-                action = decision.get("action")
-                confidence = decision.get("confidence", 0)
-
-                # 1. Macro Trend Gating
-                if action == "BUY" and system_state.macro_bias == "BEARISH":
-                    logger.info(f"Skipping BUY for {ticker}: Blocked by BEARISH macro regime.")
-                    continue
-                if action == "SELL" and system_state.macro_bias == "BULLISH":
-                    logger.info(f"Skipping SELL for {ticker}: Blocked by BULLISH macro regime.")
-                    continue
-
-                # 2. Portfolio Directional Lock
-                if action == "BUY" and portfolio_direction == "SHORT_ONLY":
-                    logger.info(f"Skipping BUY for {ticker}: Portfolio locked to SHORT_ONLY while short positions are open.")
-                    continue
-                if action == "SELL" and portfolio_direction == "LONG_ONLY":
-                    logger.info(f"Skipping SELL for {ticker}: Portfolio locked to LONG_ONLY while long positions are open.")
-                    continue
-
-                if action in ("BUY", "SELL") and confidence >= 78 and ticker not in system_state.open_positions:
-                    real_price = system_state.latest_quotes[ticker]["price"]
-                    metrics = analysis.get("metrics", {})
-                    raw_atr = metrics.get("atr_14")
-                    atr = float(raw_atr) if raw_atr and raw_atr > 0 else max(0.5, real_price * 0.003)
-
-                    # Dynamic volatility stops: >= 2.2x ATR or >= 0.55% of stock price
-                    min_stop_distance = max(atr * 2.2, real_price * 0.0055)
-                    raw_sl = decision.get("stop_loss")
-                    raw_tp = decision.get("take_profit")
-
-                    if action == "BUY":
-                        if not raw_sl or raw_sl >= real_price or (real_price - raw_sl) < min_stop_distance:
-                            stop_loss = round(real_price - min_stop_distance, 2)
-                        else:
-                            stop_loss = round(float(raw_sl), 2)
-
-                        risk_dist = real_price - stop_loss
-                        if not raw_tp or raw_tp <= real_price:
-                            take_profit = round(real_price + (risk_dist * 2.0), 2)
-                        else:
-                            take_profit = round(float(raw_tp), 2)
-                    else:  # SELL / SHORT
-                        if not raw_sl or raw_sl <= real_price or (raw_sl - real_price) < min_stop_distance:
-                            stop_loss = round(real_price + min_stop_distance, 2)
-                        else:
-                            stop_loss = round(float(raw_sl), 2)
-
-                        risk_dist = stop_loss - real_price
-                        if not raw_tp or raw_tp >= real_price:
-                            take_profit = round(real_price - (risk_dist * 2.0), 2)
-                        else:
-                            take_profit = round(float(raw_tp), 2)
-
-                    await open_position(
-                        ticker=ticker,
-                        action=action,
-                        current_price=real_price,
-                        stop_loss=stop_loss,
-                        take_profit=take_profit,
-                        reasoning=decision.get("reasoning", "Confirmed 2-bar momentum setup")
-                    )
 
         system_state.last_fetch_error = None
 
@@ -331,18 +275,184 @@ async def sync_market_data():
         logger.warning(error_msg)
         system_state.last_fetch_error = error_msg
 
+    # Risk first, always. This runs before and independently of any LLM work.
     await update_open_positions_and_risk(system_state.latest_quotes)
 
     if system_state.session_phase == "RTH_EOD_CLOSING" and system_state.open_positions:
         logger.info("RTH_EOD_CLOSING reached. Flattening all intraday positions.")
         await liquidate_all_positions(reason="RTH_EOD_AUTO_CLOSE")
+        return
+
+    if not (system_state.is_active and system_state.session_phase in ("RTH_PRIME_MORNING", "RTH_PRIME_AFTERNOON")):
+        return
+
+    # ---------------------------------------------------------------------
+    # Candidate collection
+    # ---------------------------------------------------------------------
+    candidates = []
+    for ticker in active_tickers:
+        analysis = system_state.technical_analysis.get(ticker, {})
+        signal = analysis.get("signal", "NEUTRAL")
+
+        # Track consecutive bar signal persistence (require 2 consecutive bars)
+        tracker = consecutive_signals.get(ticker, {"signal": "NEUTRAL", "bars": 0})
+        if signal != "NEUTRAL" and signal == tracker["signal"]:
+            tracker["bars"] += 1
+        else:
+            tracker = {"signal": signal, "bars": 1 if signal != "NEUTRAL" else 0}
+        consecutive_signals[ticker] = tracker
+
+        if signal in ("NEUTRAL", None):
+            continue
+        if ticker in system_state.open_positions:
+            continue
+        if ticker in _inflight_evaluations:
+            continue
+        if tracker["bars"] < 2:
+            continue
+
+        action = "BUY" if "BULLISH" in signal or "LONG" in signal else "SELL"
+
+        # Macro trend gating
+        if action == "BUY" and system_state.macro_bias == "BEARISH":
+            _blocked(ticker, "macro_bias")
+            continue
+        if action == "SELL" and system_state.macro_bias == "BULLISH":
+            _blocked(ticker, "macro_bias")
+            continue
+
+        # Portfolio directional lock -- checked per candidate, and re-checked
+        # after every fill inside the entry loop below.
+        if action == "BUY" and portfolio_direction() == "SHORT_ONLY":
+            _blocked(ticker, "direction_lock")
+            continue
+        if action == "SELL" and portfolio_direction() == "LONG_ONLY":
+            _blocked(ticker, "direction_lock")
+            continue
+
+        # Correlation cluster cap
+        peers = cluster_positions(cluster_for(ticker))
+        if len(peers) >= cfg.max_positions_per_cluster:
+            _blocked(ticker, f"cluster_cap:{cluster_for(ticker)}")
+            continue
+
+        candidates.append({
+            "ticker": ticker,
+            "action": action,
+            "signal": signal,
+            "analysis": analysis,
+            "score": analysis.get("setup_score", 0.0),
+        })
+
+    if not candidates:
+        return
+
+    # ---------------------------------------------------------------------
+    # Ranked selection: take the best N rather than everything that voted.
+    # ---------------------------------------------------------------------
+    slots = cfg.max_trades_per_day - system_state.daily_trade_count
+    slots = min(slots, cfg.max_total_open_positions - len(system_state.open_positions))
+    if slots <= 0:
+        for c in candidates:
+            _blocked(c["ticker"], "daily_budget_or_position_cap")
+        return
+
+    candidates.sort(key=lambda c: c["score"], reverse=True)
+    selected = candidates[:slots]
+    for c in candidates[slots:]:
+        logger.info(
+            f"Deferring {c['ticker']} (score {c['score']:.3f}) -- "
+            f"only {slots} slot(s) available today."
+        )
+
+    # Fire LLM evaluations concurrently; never block the risk loop on them.
+    for cand in selected:
+        task = asyncio.create_task(_evaluate_and_maybe_trade(cand))
+        _inflight_evaluations.add(task)
+        task.add_done_callback(_inflight_evaluations.discard)
+
+
+async def _evaluate_and_maybe_trade(cand: Dict[str, Any]):
+    """
+    Runs the LLM gate for one candidate and opens the position if it passes.
+
+    Runs as a background task so that a slow Gemini response cannot freeze
+    ``update_open_positions_and_risk``.
+    """
+    ticker = cand["ticker"]
+    try:
+        decision = await asyncio.wait_for(
+            evaluate_intraday_opportunity(
+                ticker=ticker,
+                session_phase=system_state.session_phase,
+                technical_analysis=cand["analysis"],
+            ),
+            timeout=LLM_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(f"Gemini timed out after {LLM_TIMEOUT_SECONDS}s for {ticker}; using technical signal.")
+        decision = {"action": cand["action"], "confidence": 0, "reasoning": "LLM timeout -- technical fallback"}
+    except Exception as exc:
+        logger.error(f"Gemini evaluation failed for {ticker}: {exc}")
+        decision = {"action": cand["action"], "confidence": 0, "reasoning": f"LLM error -- technical fallback"}
+
+    system_state.agent_evaluations[ticker] = {
+        "timestamp": datetime.utcnow().isoformat(),
+        "decision": decision,
+    }
+
+    cfg = get_risk_config()
+    action = (decision.get("action") or cand["action"]).upper()
+    confidence = decision.get("confidence", 0) or 0
+
+    if action not in ("BUY", "SELL"):
+        logger.info(f"{ticker}: agent returned {action}; no trade.")
+        return
+    if confidence and confidence < 78:
+        logger.info(f"{ticker}: agent confidence {confidence} below 78; no trade.")
+        return
+
+    # Macro + direction + cluster gates, re-checked at execution time.
+    if action == "BUY" and system_state.macro_bias == "BEARISH":
+        _blocked(ticker, "macro_bias")
+        return
+    if action == "SELL" and system_state.macro_bias == "BULLISH":
+        _blocked(ticker, "macro_bias")
+        return
+    if action == "BUY" and portfolio_direction() == "SHORT_ONLY":
+        _blocked(ticker, "direction_lock")
+        return
+    if action == "SELL" and portfolio_direction() == "LONG_ONLY":
+        _blocked(ticker, "direction_lock")
+        return
+
+    real_price = system_state.latest_quotes.get(ticker, {}).get("price")
+    if not real_price:
+        return
+
+    metrics = cand["analysis"].get("metrics", {})
+    atr = metrics.get("atr_14")
+    stop_loss, take_profit = compute_stop_and_target(action, real_price, atr, cfg)
+
+    await open_position(
+        ticker=ticker,
+        action=action,
+        current_price=real_price,
+        stop_loss=stop_loss,
+        take_profit=take_profit,
+        reasoning=decision.get("reasoning", "Confirmed 2-bar momentum setup"),
+        atr=atr,
+        atr_pct=metrics.get("atr_pct"),
+        signal=cand["signal"],
+        setup_score=cand["score"],
+    )
 
 
 async def run_intraday_tick_loop():
     """Background asynchronous loop for market monitoring and buffer updates."""
     logger.info("Day-Trading Intraday Loop initialized.")
     init_db()
-    
+
     await sync_market_data()
 
     while True:

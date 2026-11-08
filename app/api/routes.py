@@ -9,9 +9,21 @@ from app.core.state import system_state
 from app.config import settings
 from app.services.buffer import buffer_manager
 from app.services.alerts import send_ntfy_alert
-from app.services.stream import fetch_single_ticker_data
+from app.services.stream import fetch_single_ticker_data, reset_daily_state
 from app.services.gemini_agent import evaluate_intraday_opportunity
-from app.services.risk_engine import open_position, close_position, liquidate_all_positions
+from app.services.risk_engine import (
+    open_position,
+    close_position,
+    liquidate_all_positions,
+    portfolio_direction,
+    cluster_for,
+    cluster_positions,
+    total_open_risk,
+    session_stats,
+    reset_session_stats,
+    compute_risk_score,
+)
+from app.services.risk_config import get_risk_config, TICKER_CLUSTERS
 from app.services.scheduler import scheduler
 
 router = APIRouter()
@@ -69,6 +81,97 @@ async def get_scheduled_jobs():
             "trigger": str(job.trigger)
         })
     return {"scheduler_running": scheduler.running, "jobs": jobs}
+
+
+@router.get("/risk/config")
+async def get_risk_configuration():
+    """The live risk parameters actually in force (sourced from rulebook.json)."""
+    return {
+        "source": "rulebook.json",
+        "config": get_risk_config().to_dict(),
+        "clusters": TICKER_CLUSTERS,
+    }
+
+
+@router.get("/risk/exposure")
+async def get_risk_exposure():
+    """Portfolio-level risk: direction lock, correlation clusters, open risk."""
+    cfg = get_risk_config()
+    clusters = {}
+    for cluster in {cluster_for(t) for t in system_state.open_positions}:
+        clusters[cluster] = cluster_positions(cluster)
+
+    positions = []
+    for ticker, pos in system_state.open_positions.items():
+        positions.append({
+            "ticker": ticker,
+            "cluster": cluster_for(ticker),
+            "action": pos["action"],
+            "shares": pos["shares"],
+            "entry_price": pos["entry_price"],
+            "stop_loss": pos["stop_loss"],
+            "take_profit": pos["take_profit"],
+            "risk_usd": round(abs(pos["entry_price"] - pos["stop_loss"]) * pos["shares"], 2),
+            "signal": pos.get("signal"),
+            "breakeven_armed": pos.get("breakeven_armed", False),
+            "max_favourable": round(pos.get("max_favourable", 0.0), 4),
+        })
+
+    return {
+        "direction": portfolio_direction(),
+        "open_positions": len(system_state.open_positions),
+        "max_open_positions": cfg.max_total_open_positions,
+        "max_positions_per_cluster": cfg.max_positions_per_cluster,
+        "total_open_risk_usd": round(total_open_risk(), 2),
+        "max_risk_per_trade": cfg.max_risk_per_trade,
+        "max_cluster_exposure_usd": round(cfg.max_cluster_exposure_usd(), 2),
+        "daily_trade_count": system_state.daily_trade_count,
+        "max_trades_per_day": cfg.max_trades_per_day,
+        "daily_realized_pnl": round(system_state.daily_realized_pnl, 2),
+        "daily_loss_limit": cfg.max_daily_loss,
+        "circuit_breaker_armed": (
+            system_state.daily_realized_pnl + system_state.daily_unrealized_pnl
+        ) <= -cfg.max_daily_loss,
+        "clusters": clusters,
+        "positions": positions,
+        "entries_blocked": system_state.entries_blocked,
+    }
+
+
+@router.get("/stats/session")
+async def get_session_stats():
+    """Exit breakdown and per-signal conditional statistics for this session."""
+    stats = dict(session_stats)
+    by_signal = stats.pop("by_signal", {})
+    trades = stats.get("trades", 0)
+    resolved = stats.get("stop_loss", 0) + stats.get("take_profit", 0)
+
+    return {
+        "totals": stats,
+        "by_signal": by_signal,
+        "exit_rates": {
+            "stop_loss_pct": round(stats.get("stop_loss", 0) / trades * 100, 1) if trades else 0.0,
+            "take_profit_pct": round(stats.get("take_profit", 0) / trades * 100, 1) if trades else 0.0,
+            "time_stop_pct": round(
+                (stats.get("time_stop", 0) + stats.get("breakeven_stop", 0)) / trades * 100, 1
+            ) if trades else 0.0,
+        },
+        "win_rate_resolved_pct": (
+            round(stats.get("take_profit", 0) / resolved * 100, 1) if resolved else None
+        ),
+        "breakeven_win_rate_pct": round(100 / (1 + get_risk_config().min_risk_reward_ratio), 1),
+        "expectancy_per_trade": (
+            round(stats.get("net_pnl", 0.0) / trades, 2) if trades else None
+        ),
+    }
+
+
+@router.post("/session/reset-daily")
+async def reset_daily_state_endpoint():
+    """Manually clears per-session state (counters, cooldowns, buffers)."""
+    reset_daily_state()
+    reset_session_stats()
+    return {"status": "reset", "message": "Daily counters, cooldowns and candle buffers cleared."}
 
 
 @router.get("/watchlist")
