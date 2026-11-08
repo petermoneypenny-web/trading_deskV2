@@ -17,6 +17,7 @@ logging.getLogger("urllib3").setLevel(logging.ERROR)
 
 from app.core.state import system_state
 from app.services.indicators import evaluate_intraday_technical_snapshot
+from app.services.gemini_agent import evaluate_intraday_opportunity
 import app.services.risk_engine as risk_engine
 from app.services.risk_engine import (
     init_db,
@@ -26,6 +27,7 @@ from app.services.risk_engine import (
     ticker_cooldowns
 )
 
+# Silence live NTFY network alerts during backtest
 risk_engine.send_ntfy_alert = AsyncMock()
 
 TICKERS = ["SPY", "QQQ", "AAPL", "NVDA", "INTC", "TSM", "MU"]
@@ -77,8 +79,8 @@ def update_macro_regime_bias():
         system_state.macro_bias = "NEUTRAL"
 
 
-async def run_replay(target_date_str: str = None):
-    logger.info("Initializing pullback-optimized replay test...")
+async def run_replay(target_date_str: str = None, with_llm: bool = False, max_llm_calls: int = 8):
+    logger.info(f"Initializing replay test harness (LLM Enabled: {with_llm}, Max API Calls: {max_llm_calls})...")
     init_db()
 
     system_state.is_active = True
@@ -144,6 +146,8 @@ async def run_replay(target_date_str: str = None):
     blocked_by_midday = 0
     blocked_by_opening_flush = 0
     blocked_by_confirmation = 0
+    blocked_by_llm = 0
+    llm_calls_made = 0
     signal_counts = {}
     consecutive_signals = {}
 
@@ -214,7 +218,7 @@ async def run_replay(target_date_str: str = None):
 
                     action = "BUY" if "BULLISH" in sig or "LONG" in sig else "SELL"
 
-                    # Macro Filter: disallow BUY if market is completely BEARISH, disallow SELL if completely BULLISH
+                    # Macro Filter: Never buy if broad market is BEARISH, never sell if BULLISH
                     if action == "BUY" and system_state.macro_bias == "BEARISH":
                         blocked_by_macro += 1
                         continue
@@ -225,8 +229,8 @@ async def run_replay(target_date_str: str = None):
                     real_price = system_state.latest_quotes[ticker]["price"]
                     metrics = analysis.get("metrics", {})
                     atr = float(metrics.get("atr_14", 1.0) or 1.0)
-
                     min_stop_distance = max(atr * 2.2, real_price * 0.0055)
+
                     if action == "BUY":
                         stop_loss = round(real_price - min_stop_distance, 2)
                         take_profit = round(real_price + (min_stop_distance * 2.0), 2)
@@ -234,13 +238,38 @@ async def run_replay(target_date_str: str = None):
                         stop_loss = round(real_price + min_stop_distance, 2)
                         take_profit = round(real_price - (min_stop_distance * 2.0), 2)
 
+                    thesis_reason = f"Pullback confirmed: {sig} (Macro: {system_state.macro_bias})"
+
+                    # LLM Gating (Runs only for verified setups up to max_llm_calls)
+                    if with_llm:
+                        if llm_calls_made < max_llm_calls:
+                            llm_calls_made += 1
+                            logger.info(f"[{et_time.strftime('%H:%M')} ET] Invoking Gemini Flash Agent ({llm_calls_made}/{max_llm_calls}) for {ticker}...")
+                            decision = await evaluate_intraday_opportunity(
+                                ticker=ticker,
+                                session_phase=session_phase,
+                                technical_analysis=analysis
+                            )
+                            llm_action = decision.get("action")
+                            confidence = decision.get("confidence", 0)
+                            thesis_reason = f"Gemini ({confidence}% conf): {decision.get('reasoning', '')}"
+
+                            if llm_action != action or confidence < 75:
+                                blocked_by_llm += 1
+                                logger.info(f"[{et_time.strftime('%H:%M')} ET] Gemini rejected {ticker}: Action={llm_action}, Conf={confidence}%")
+                                continue
+                        else:
+                            # If budget is reached, default to HOLD to preserve quota
+                            blocked_by_llm += 1
+                            continue
+
                     opened = await open_position(
                         ticker=ticker,
                         action=action,
                         current_price=real_price,
                         stop_loss=stop_loss,
                         take_profit=take_profit,
-                        reasoning=f"Pullback confirmed: {sig} (Macro: {system_state.macro_bias})"
+                        reasoning=thesis_reason
                     )
                     if opened:
                         trades_opened += 1
@@ -254,13 +283,18 @@ async def run_replay(target_date_str: str = None):
     logger.info(f"Entries Blocked by 11:30-14:15 Midday Chop: {blocked_by_midday}")
     logger.info(f"Entries Blocked by Macro Bias Filter: {blocked_by_macro}")
     logger.info(f"Entries Blocked by 2-Bar Confirmation: {blocked_by_confirmation}")
+    if with_llm:
+        logger.info(f"Gemini LLM Calls Dispatched: {llm_calls_made}/{max_llm_calls}")
+        logger.info(f"Entries Vetoed by Gemini: {blocked_by_llm}")
     logger.info(f"Total Trades Opened: {trades_opened}")
     logger.info(f"Final Realized P&L: ${system_state.daily_realized_pnl:+.2f}")
     logger.info("=" * 60)
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Replay intraday trading simulation for a specific date.")
+    parser = argparse.ArgumentParser(description="Replay intraday trading simulation with optional Gemini evaluation.")
     parser.add_argument("--date", type=str, default=None, help="Target date in YYYY-MM-DD format.")
+    parser.add_argument("--with-llm", action="store_true", help="Enable live Gemini Flash agent evaluation.")
+    parser.add_argument("--max-llm-calls", type=int, default=8, help="Maximum number of Gemini API calls permitted.")
     args = parser.parse_args()
 
-    asyncio.run(run_replay(args.date))
+    asyncio.run(run_replay(args.date, with_llm=args.with_llm, max_llm_calls=args.max_llm_calls))
