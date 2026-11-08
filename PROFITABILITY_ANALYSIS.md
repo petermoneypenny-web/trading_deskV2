@@ -446,3 +446,118 @@ freeze `update_open_positions_and_risk` (previously up to ~80s per cycle with a
    long your setups actually take to work.
 4. **Watch the first live sessions.** The new engine will take *fewer* trades
    (ranked, capped at 6/day, 1 per cluster) and hold them longer.
+
+---
+
+# PART 3 — Month-scale backtesting without the LLM
+
+Added after the two regressions (short Gemini timeout, opening-spike-biased
+`relative_volume`) were fixed. The question was: *can we test a full month of
+1-minute data with zero Gemini API calls?*
+
+`replay_csv.py` already replayed multi-week datasets with the LLM off, but it
+was not usable for this at scale, and it had a reporting defect that would have
+misled any month-long run.
+
+## Four bugs found while building it
+
+**1. The summary described the last session, not the run.**
+`session_stats` is reset every session (correctly — it is per-day state), but
+`_log_summary` read it *after* the loop. A 21-session run reported
+**67 trades and +$803.96**, while its own exit breakdown described
+**2 trades and +$91.64**. The win rate, profit factor and per-signal tables
+were all single-day numbers presented as month-wide ones. Fixed by folding each
+session into a running total, and by reading per-ticker/per-action/per-exit
+tables from the trade journal (`close_position` already persists them) rather
+than from a second bookkeeping path that could drift.
+
+**2. A backtest wrote into the live trade journal.**
+`init_db()` and `close_position` both use `settings.DATABASE_URL`, which in the
+container is the same SQLite file the running engine uses. Every replay
+therefore appended fabricated trades to real trading history, and every
+subsequent report was wrong. Replays now default to a private
+`backtest_trades.db` next to the CSV (`--db` to override).
+
+**3. Parameter overrides leaked between sweep runs.**
+`get_risk_config()` caches a process-wide singleton. A sweep reuses worker
+processes, so the second configuration a worker saw inherited the first one's
+values — `hold_20m` was coming back with `atr_stop_multiplier=2.0` left over
+from the previous task. Silently produced chimeric results. Fixed with
+`get_risk_config(reload=True)` at the top of every run.
+
+**4. One bad day paused the rest of the month.**
+`check_daily_circuit_breaker()` sets `system_state.is_active = False`, and
+nothing in the replay ever set it back. Once a session breached
+`max_daily_loss`, every later session ran with the system flagged paused. The
+replay's entry path does not read `is_active`, so this did not corrupt results
+— but it made the "System paused" log a lie and left a live trap for anyone who
+later wires the replay through the real signal loop. Now restored per session.
+
+## What was added
+
+| File | Purpose |
+|---|---|
+| `backtest_month.py` | Batch runner: many configurations, one dataset, no LLM |
+| `replay_csv.py` | Now returns a result dict; `--db`, `--from`, `--to`, `--quiet` |
+| `download_dataset.py` | `--out` so data can be fetched outside the container |
+
+`backtest_month.py`:
+
+* **One subprocess per configuration.** The engine keeps session state in
+  module globals (`system_state`, `ticker_cooldowns`, `consecutive_signals`,
+  the `RiskConfig` singleton). Running two configurations in one process leaks
+  state between them; a fresh process per run is the only cheap guarantee.
+* **In-sample / out-of-sample split, always on.** A sweep of 19 configs over one
+  month will always find a winner by chance. `--split 0.6` replays the first 60%
+  of sessions and the last 40% separately, and ranks on what each configuration
+  did on dates it was not chosen on. Configs that are profitable in-sample and
+  losing out-of-sample are called out explicitly.
+* **19 named sweeps** covering the levers the profitability work actually moved:
+  stop geometry (`atr_2.0`, `minstop_0.004`), target (`rr_2.0`, `rr_3.5`), trade
+  management (`hold_20m`, `no_breakeven`), sizing (`risk_25`, `risk_100`),
+  breadth (`pos_2`, `pos_5`, `cluster_3`, `trades_12`), the liquidity gate
+  (`relvol_off`, `relvol_1.2`) and costs (`costs_2x`).
+* **Ad-hoc overrides** with `--set target_rr=3.0,max_hold_minutes=30`, so a
+  parameter can be tested without editing `rulebook.json`.
+* **Persisted reports**: `results.json`, `summary_in_sample.csv`,
+  `summary_out_of_sample.csv`, `daily_pnl.csv` under `data/backtests/<label>/`.
+  The JSON holds numbers, not formatted strings, so it can be loaded and
+  compared programmatically.
+
+## Measured on a synthetic 1-month dataset
+
+4 tickers × 21 sessions × 390 bars, U-shaped volume, mean-reverting price:
+
+* **133 s per configuration**, 12 runs across 4 workers in 433 s wall clock.
+* Sweeping 6 configurations produced an overfit warning on 2 of them — the
+  machinery works and is willing to say "this one is noise".
+* `pos_5` correctly came back identical to `baseline`: with 4 tickers spread
+  across 3 correlation clusters and `max_positions_per_cluster = 1`, the cluster
+  cap binds before `max_total_open_positions`, so raising the latter changes
+  nothing. That is the de-correlation fix doing its job.
+
+## How to run it on the QNAP
+
+```bash
+# 1. fetch a month of 1m data (Yahoo caps 1m at ~30 days)
+docker compose exec trading-desk-v2 python3 download_dataset.py --days 30
+
+# 2. single run, whole month, no LLM
+python3 replay_csv.py --csv data/historical_1m_30d.csv
+
+# 3. sweep everything, ranked out-of-sample
+python3 backtest_month.py --csv data/historical_1m_30d.csv --sweep all --jobs 4 --split 0.6
+
+# 4. one specific question
+python3 backtest_month.py --csv data/historical_1m_30d.csv --set target_rr=3.0 --split 0
+```
+
+Every number these produce is deterministic and costs nothing in API quota.
+
+## What this still cannot tell you
+
+The synthetic dataset above is a random walk with a U-shaped volume profile. It
+proves the *machinery* is correct — the aggregation, the split, the isolation,
+the override handling — and it produced a tidy +$803.96 that means absolutely
+nothing about the market. Only real Yahoo data answers the economic question,
+and that has to be fetched from the QNAP.

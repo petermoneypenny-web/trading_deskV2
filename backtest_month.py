@@ -1,0 +1,478 @@
+"""
+Month-scale batch backtest -- no LLM, zero API quota.
+
+``replay_csv.py`` replays one configuration over a whole multi-week dataset and
+prints a report. That is enough to answer "what happened", but the interesting
+question after tuning the rulebook is "which of these settings actually earns
+its keep, and is that just curve-fitting?". This script runs the *same*
+engine over many configurations, splits the month into in-sample and
+out-of-sample halves, and ranks the configs on what they did out of sample.
+
+Why it is built this way:
+
+  * One subprocess per configuration. The engine keeps session state in module
+    globals (``system_state``, ``ticker_cooldowns``, ``consecutive_signals``,
+    the ``RiskConfig`` singleton). Running two configurations in one process
+    would leak state between them and quietly corrupt the second result. A
+    fresh process per run is the only cheap way to guarantee isolation.
+
+  * In-sample / out-of-sample split, always. A sweep of 15 configs over one
+    month will always produce a winner by chance. Splitting the month means the
+    ranking is based on dates the configuration was not chosen on.
+
+  * A private trade journal per run. The replay writes closed trades to SQLite;
+    without a per-run file every configuration would append to the same table
+    and the live database.
+
+  * No LLM anywhere. Every number here is reproducible for free.
+
+Usage
+-----
+    # single run over the whole month, same as replay_csv.py
+    python3 backtest_month.py --csv data/historical_1m_30d.csv
+
+    # sweep everything, 4 workers, split the month 60/40
+    python3 backtest_month.py --csv data/historical_1m_30d.csv --sweep all --jobs 4 --split 0.6
+
+    # just the stop geometry and target settings
+    python3 backtest_month.py --csv data/historical_1m_30d.csv --sweep atr_2.0,rr_2.0
+
+    # ad-hoc override without editing rulebook.json
+    python3 backtest_month.py --csv data/historical_1m_30d.csv --set target_rr=3.0,max_hold_minutes=30
+
+Results are written to ``data/backtests/<label>/`` as results.json,
+summary.csv and daily_pnl.csv.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import logging
+import os
+import sys
+import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Tuple
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("backtest_month")
+logging.getLogger("replay_csv").setLevel(logging.ERROR)
+
+# --------------------------------------------------------------------------
+# Named sweeps
+# --------------------------------------------------------------------------
+# Each entry is a set of RiskConfig overrides applied on top of rulebook.json.
+# They are chosen to probe exactly the levers the profitability work moved, so
+# the report says whether each change was load-bearing or incidental.
+SWEEPS: Dict[str, Dict[str, Any]] = {
+    "baseline": {},
+
+    # stop geometry
+    "atr_2.0":       {"atr_stop_multiplier": 2.0},
+    "atr_3.0":       {"atr_stop_multiplier": 3.0},
+    "minstop_0.004": {"min_stop_pct": 0.004},
+    "minstop_0.015": {"min_stop_pct": 0.015},
+
+    # target
+    "rr_2.0":        {"target_rr": 2.0},
+    "rr_3.5":        {"target_rr": 3.5},
+
+    # trade management
+    "hold_20m":      {"max_hold_minutes": 20},
+    "hold_90m":      {"max_hold_minutes": 90},
+    "no_breakeven":  {"breakeven_trigger_r": 99.0},
+
+    # sizing
+    "risk_25":       {"max_risk_per_trade": 25.0},
+    "risk_100":      {"max_risk_per_trade": 100.0},
+
+    # breadth
+    "pos_2":         {"max_total_open_positions": 2},
+    "pos_5":         {"max_total_open_positions": 5},
+    "cluster_3":     {"max_positions_per_cluster": 3},
+    "trades_12":     {"max_trades_per_day": 12},
+
+    # liquidity gate
+    "relvol_off":    {"min_relative_volume": 0.0},
+    "relvol_1.2":    {"min_relative_volume": 1.2},
+
+    # costs
+    "costs_2x":      {"commission_per_share": 0.01, "slippage_pct": 0.0004},
+}
+
+
+def _parse_set(pairs: List[str]) -> Dict[str, Any]:
+    """``target_rr=3.0,max_hold_minutes=30`` -> dict, with light type coercion."""
+    out: Dict[str, Any] = {}
+    for pair in pairs:
+        if "=" not in pair:
+            raise SystemExit(f"--set expects key=value, got {pair!r}")
+        key, raw = pair.split("=", 1)
+        key = key.strip()
+        try:
+            out[key] = int(raw)
+        except ValueError:
+            try:
+                out[key] = float(raw)
+            except ValueError:
+                out[key] = raw.strip()
+    return out
+
+
+# --------------------------------------------------------------------------
+# Worker (runs in its own process)
+# --------------------------------------------------------------------------
+def _run_one(task: Dict[str, Any]) -> Dict[str, Any]:
+    """Execute one configuration. Never raises: failures come back as errors."""
+    import asyncio
+
+    from replay_csv import run_simulation
+
+    started = time.time()
+    # Each configuration runs in its own process; without this the children
+    # spam the console with the same per-bar chatter the parent suppressed.
+    logging.getLogger().setLevel(logging.ERROR)
+    logging.disable(logging.INFO)
+    try:
+        result = asyncio.run(run_simulation(
+            csv_path=task["csv"],
+            tickers=task["tickers"],
+            use_llm=False,
+            db_path=task["db"],
+            date_from=task["date_from"],
+            date_to=task["date_to"],
+            verbose=False,
+            config_overrides=task["overrides"],
+            max_hold_minutes=task.get("max_hold_minutes"),
+        ))
+    except Exception as exc:  # pragma: no cover - defensive
+        return {"label": task["label"], "phase": task["phase"],
+                "overrides": task["overrides"], "error": f"{type(exc).__name__}: {exc}",
+                "elapsed_s": round(time.time() - started, 1)}
+
+    if result is None:
+        return {"label": task["label"], "phase": task["phase"],
+                "overrides": task["overrides"], "error": "no result (see log)",
+                "elapsed_s": round(time.time() - started, 1)}
+
+    result["label"] = task["label"]
+    result["phase"] = task["phase"]
+    result["overrides"] = task["overrides"]
+    result["elapsed_s"] = round(time.time() - started, 1)
+    return result
+
+
+# --------------------------------------------------------------------------
+# Dataset helpers
+# --------------------------------------------------------------------------
+def _session_dates(csv_path: str) -> List[str]:
+    import pandas as pd
+    df = pd.read_csv(csv_path, usecols=["timestamp"])
+    dates = pd.to_datetime(df["timestamp"], utc=True).dt.date.unique()
+    return [d.strftime("%Y-%m-%d") for d in sorted(dates)]
+
+
+def _split_dates(dates: List[str], split: float) -> Tuple[Optional[str], Optional[str]]:
+    """Cut the session list into an in-sample and an out-of-sample range."""
+    if split <= 0 or split >= 1 or len(dates) < 4:
+        return None, None
+    cut = max(1, int(len(dates) * split))
+    if cut >= len(dates):
+        return None, None
+    return dates[cut - 1], dates[cut]
+
+
+# --------------------------------------------------------------------------
+# Reporting
+# --------------------------------------------------------------------------
+def _fmt(v: Any, kind: str = "f") -> str:
+    if v is None:
+        return "-"
+    if kind == "s":
+        return str(v)
+    if kind == "usd":
+        return f"${v:+,.2f}"
+    if kind == "pct":
+        return f"{v:.1f}%"
+    if kind == "n":
+        return str(v)
+    return f"{v:.3f}"
+
+
+def _print_table(rows: List[Dict[str, Any]], cols: List[Tuple[str, str]]) -> None:
+    """cols: [(header, kind)]"""
+    widths = [len(h) for h, _ in cols]
+    cells: List[List[str]] = []
+    for r in rows:
+        line = [_fmt(r.get(k), kind) for k, kind in cols]
+        widths = [max(w, len(c)) for w, c in zip(widths, line)]
+        cells.append(line)
+    header = "  " + "  ".join(h.ljust(w) for h, w in zip([c[0] for c in cols], widths))
+    logger.info(header)
+    logger.info("  " + "  ".join("-" * w for w in widths))
+    for line in cells:
+        logger.info("  " + "  ".join(c.ljust(w) for c, w in zip(line, widths)))
+
+
+def _rank(rows: List[Dict[str, Any]], key: str) -> List[Dict[str, Any]]:
+    return sorted([r for r in rows if r.get(key) is not None], key=lambda r: -r[key])
+
+
+def _write_reports(out_dir: str, payload: Dict[str, Any],
+                   is_rows: List[Dict[str, Any]], oos_rows: List[Dict[str, Any]]) -> None:
+    os.makedirs(out_dir, exist_ok=True)
+
+    with open(os.path.join(out_dir, "results.json"), "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2, default=str)
+
+    cols = [("label", "s"), ("trades", "n"), ("net_pnl", "usd"),
+            ("expectancy", "usd"), ("win_rate_resolved", "pct"),
+            ("profit_factor", "f"), ("max_drawdown_usd", "usd"),
+            ("profitable_sessions", "n"), ("stop_loss", "n"),
+            ("take_profit", "n"), ("time_stop", "n")]
+    keys = [c[0] for c in cols]
+    for fname, rows in (("summary_in_sample.csv", is_rows), ("summary_out_of_sample.csv", oos_rows)):
+        if not rows:
+            continue
+        with open(os.path.join(out_dir, fname), "w", newline="", encoding="utf-8") as fh:
+            w = csv.DictWriter(fh, fieldnames=keys, extrasaction="ignore")
+            w.writeheader()
+            for r in rows:
+                w.writerow({k: r.get(k) for k in keys})
+
+    daily: Dict[str, Dict[str, float]] = {}
+    for run in payload["runs"]:
+        if run.get("error") or not run.get("daily"):
+            continue
+        tag = f"{run['label']}|{run['phase']}"
+        for d in run["daily"]:
+            daily.setdefault(tag, {})[d["date"]] = round(float(d["pnl"]), 2)
+    if daily:
+        dates = sorted({d for v in daily.values() for d in v})
+        with open(os.path.join(out_dir, "daily_pnl.csv"), "w", newline="", encoding="utf-8") as fh:
+            w = csv.writer(fh)
+            w.writerow(["run"] + dates)
+            for tag, by_date in daily.items():
+                w.writerow([tag] + [by_date.get(d, "") for d in dates])
+
+    logger.info(f"Reports written to {out_dir}/")
+
+
+def _print_verdict(payload: Dict[str, Any]) -> None:
+    """The honest part: did the in-sample winner survive out of sample?"""
+    is_rows = [r for r in payload["runs"] if r.get("phase") == "is" and not r.get("error")]
+    oos_rows = [r for r in payload["runs"] if r.get("phase") == "oos" and not r.get("error")]
+    if not oos_rows:
+        return
+
+    logger.info("=" * 78)
+    logger.info("OUT-OF-SAMPLE RANKING (the number that counts)")
+    logger.info("=" * 78)
+    _print_table(_rank(oos_rows, "expectancy"), [
+        ("label", "s"), ("trades", "n"), ("net_pnl", "usd"),
+        ("expectancy", "usd"), ("win_rate_resolved", "pct"),
+        ("profit_factor", "f"), ("max_drawdown_usd", "usd"),
+    ])
+
+    if is_rows:
+        logger.info("-" * 78)
+        logger.info("IN-SAMPLE (for reference only -- these were chosen on this data)")
+        _print_table(_rank(is_rows, "expectancy"), [
+            ("label", "s"), ("trades", "n"), ("net_pnl", "usd"),
+            ("expectancy", "usd"), ("win_rate_resolved", "pct"),
+            ("profit_factor", "f"),
+        ])
+
+        is_by = {r["label"]: r for r in is_rows}
+        oos_by = {r["label"]: r for r in oos_rows}
+        decays = []
+        for label, i in is_by.items():
+            o = oos_by.get(label)
+            if not o or i.get("expectancy") is None or o.get("expectancy") is None:
+                continue
+            if i["expectancy"] > 0 > o["expectancy"]:
+                decays.append((label, i["expectancy"], o["expectancy"]))
+        if decays:
+            logger.info("-" * 78)
+            logger.info("OVERFIT WARNING -- profitable in sample, losing out of sample:")
+            for label, i, o in sorted(decays, key=lambda x: x[2]):
+                logger.info(f"    {label:16s} in-sample ${i:+.2f}/trade -> "
+                            f"out-of-sample ${o:+.2f}/trade")
+            logger.info("  A sweep over one month will always find a winner by chance.")
+            logger.info("  Treat only the configs that survive both halves as real.")
+
+
+# --------------------------------------------------------------------------
+# Main
+# --------------------------------------------------------------------------
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Batch backtest over a month of 1m data with no LLM calls.")
+    parser.add_argument("--csv", type=str,
+                        default=os.environ.get("REPLAY_CSV", "data/historical_1m_30d.csv"),
+                        help="Wide-format 1m dataset: timestamp + <TICKER>_{open,high,low,close,volume}.")
+    parser.add_argument("--tickers", type=str, default="SPY,QQQ,AAPL,NVDA",
+                        help="Comma-separated tickers present in the CSV.")
+    parser.add_argument("--sweep", type=str, default="baseline",
+                        help="Comma-separated sweep names, or 'all'.")
+    parser.add_argument("--set", dest="sets", action="append", default=[],
+                        help="Ad-hoc override key=value (repeatable, comma-separated ok).")
+    parser.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) - 1),
+                        help="Parallel configurations. Each gets its own process.")
+    parser.add_argument("--split", type=float, default=0.6,
+                        help="Fraction of sessions used as in-sample (0 or 1 disables).")
+    parser.add_argument("--out", type=str, default=None,
+                        help="Output directory. Defaults to data/backtests/<label>.")
+    parser.add_argument("--label", type=str, default=None, help="Name for this batch.")
+    parser.add_argument("--max-hold-minutes", type=int, default=None,
+                        help="Override the time stop for every configuration.")
+    args = parser.parse_args()
+
+    if not os.path.exists(args.csv):
+        logger.error(f"Dataset not found: {args.csv}")
+        logger.error("Fetch one first (Yahoo serves ~30 days of 1m bars, so a month is the ceiling):")
+        logger.error("    docker compose exec trading-desk-v2 python3 download_dataset.py --days 30")
+        logger.error("or locally:")
+        logger.error("    python3 download_dataset.py --days 30 --out data/historical_1m_30d.csv")
+        return 2
+
+    tickers = [t.strip().upper() for t in args.tickers.split(",") if t.strip()]
+
+    # ---- resolve the configurations to run --------------------------------
+    names = [n.strip() for n in args.sweep.split(",") if n.strip()]
+    if "all" in names:
+        names = list(SWEEPS)
+    configs: List[Tuple[str, Dict[str, Any]]] = []
+    for name in names:
+        if name not in SWEEPS:
+            logger.error(f"Unknown sweep {name!r}. Available: {', '.join(SWEEPS)}")
+            return 2
+        configs.append((name, dict(SWEEPS[name])))
+    for pair in args.sets:
+        configs.append(("custom:" + pair, _parse_set(pair.split(","))))
+    if not configs:
+        logger.error("Nothing to run.")
+        return 2
+
+    dates = _session_dates(args.csv)
+    if len(dates) < 4:
+        logger.error(f"Only {len(dates)} session(s) in {args.csv}; need at least 4.")
+        return 2
+    is_to, oos_from = _split_dates(dates, args.split)
+    if is_to is None:
+        logger.warning("Split disabled or too few sessions -- running the whole month per config.")
+
+    label = args.label or (args.sweep if args.sweep != "all" else "sweep_all")
+    label = "".join(c if c.isalnum() or c in "-_." else "_" for c in label)
+    out_dir = args.out or os.path.join("data", "backtests", f"{label}_{len(dates)}s")
+
+    logger.info("=" * 78)
+    logger.info("MONTH-SCALE BATCH BACKTEST (no LLM)")
+    logger.info("=" * 78)
+    logger.info(f"Dataset        : {args.csv}")
+    logger.info(f"Sessions       : {len(dates)} ({dates[0]} .. {dates[-1]})")
+    logger.info(f"Tickers        : {', '.join(tickers)}")
+    logger.info(f"Configurations : {len(configs)}")
+    logger.info(f"Workers        : {args.jobs}")
+    if is_to:
+        logger.info(f"In-sample      : {dates[0]} .. {is_to} "
+                    f"({sum(1 for d in dates if d <= is_to)} sessions)")
+        logger.info(f"Out-of-sample  : {oos_from} .. {dates[-1]} "
+                    f"({sum(1 for d in dates if d >= oos_from)} sessions)")
+    else:
+        logger.info("Split          : disabled (whole month per configuration)")
+
+    # ---- build the task list ---------------------------------------------
+    tasks: List[Dict[str, Any]] = []
+    for name, overrides in configs:
+        for phase, dfrom, dto in (("is", None, is_to), ("oos", oos_from, None),
+                                  ("all", None, None)):
+            if phase == "is" and is_to is None:
+                continue
+            if phase == "oos" and oos_from is None:
+                continue
+            if phase == "all" and is_to is not None:
+                continue
+            safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in name)
+            tasks.append({
+                "label": name, "phase": phase, "overrides": overrides,
+                "csv": os.path.abspath(args.csv), "tickers": tickers,
+                "db": os.path.abspath(os.path.join(out_dir, f"journal_{safe}_{phase}.db")),
+                "date_from": dfrom, "date_to": dto,
+                "max_hold_minutes": args.max_hold_minutes,
+            })
+
+    os.makedirs(out_dir, exist_ok=True)
+    logger.info(f"Runs           : {len(tasks)}")
+    logger.info(f"Output         : {out_dir}")
+    logger.info("-" * 78)
+
+    # ---- execute ----------------------------------------------------------
+    runs: List[Dict[str, Any]] = []
+    t0 = time.time()
+    with ProcessPoolExecutor(max_workers=max(1, args.jobs)) as pool:
+        futures = {pool.submit(_run_one, t): t for t in tasks}
+        done = 0
+        for fut in as_completed(futures):
+            task = futures[fut]
+            done += 1
+            try:
+                res = fut.result()
+            except Exception as exc:  # pragma: no cover - defensive
+                res = {"label": task["label"], "phase": task["phase"],
+                       "overrides": task["overrides"],
+                       "error": f"{type(exc).__name__}: {exc}"}
+            runs.append(res)
+            if res.get("error"):
+                logger.info(f"[{done}/{len(tasks)}] {res['label']:18s} {res['phase']:>3s}  "
+                            f"ERROR: {res['error']}")
+            else:
+                logger.info(
+                    f"[{done}/{len(tasks)}] {res['label']:18s} {res['phase']:>3s}  "
+                    f"trades={res['trades']:3d}  net={_fmt(res['net_pnl'], 'usd'):>12s}  "
+                    f"exp={_fmt(res['expectancy'], 'usd'):>9s}  "
+                    f"wr={_fmt(res.get('win_rate_resolved'), 'pct'):>6s}  "
+                    f"({res.get('elapsed_s', 0):.0f}s)")
+
+    runs.sort(key=lambda r: (r.get("phase", ""), r.get("label", "")))
+    payload = {
+        "generated": datetime.utcnow().isoformat() + "Z",
+        "dataset": os.path.abspath(args.csv),
+        "tickers": tickers,
+        "sessions": len(dates),
+        "session_dates": dates,
+        "split": {"in_sample_through": is_to, "out_of_sample_from": oos_from},
+        "wall_seconds": round(time.time() - t0, 1),
+        "runs": runs,
+    }
+
+    is_rows = [r for r in runs if r.get("phase") == "is" and not r.get("error")]
+    oos_rows = [r for r in runs if r.get("phase") == "oos" and not r.get("error")]
+    all_rows = [r for r in runs if r.get("phase") == "all" and not r.get("error")]
+
+    if all_rows:
+        logger.info("=" * 78)
+        logger.info("WHOLE-MONTH RESULTS")
+        logger.info("=" * 78)
+        _print_table(_rank(all_rows, "expectancy"), [
+            ("label", "s"), ("trades", "n"), ("net_pnl", "usd"),
+            ("expectancy", "usd"), ("win_rate_resolved", "pct"),
+            ("profit_factor", "f"), ("max_drawdown_usd", "usd"),
+        ])
+
+    _print_verdict(payload)
+    _write_reports(out_dir, payload, is_rows, oos_rows)
+
+    logger.info("=" * 78)
+    logger.info(f"{len(tasks)} run(s) in {time.time() - t0:.0f}s "
+                f"({(time.time() - t0) / max(1, len(tasks)):.0f}s each). "
+                f"LLM calls: 0.")
+    logger.info("=" * 78)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

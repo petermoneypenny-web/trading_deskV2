@@ -63,9 +63,15 @@ def download_month_dataset(tickers, days=30, output_path=OUTPUT_FILE):
     print(f"Saved {len(export_df)} 1-minute bars across {len(tickers)} tickers to {output_path}")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description="Download a month of 1m bars from Yahoo (30 days is the "
+                    "practical ceiling for the 1m interval).")
     parser.add_argument("--tickers", nargs="+", default=DEFAULT_TICKERS)
     parser.add_argument("--days", type=int, default=30)
+    # The container path is the default so `docker compose exec` works with no
+    # arguments, but a local run needs to be able to write somewhere else.
+    parser.add_argument("--out", type=str, default=OUTPUT_FILE,
+                        help=f"Output CSV path (default: {OUTPUT_FILE}).")
     args = parser.parse_args()
-    
-    download_month_dataset(args.tickers, args.days)
+
+    download_month_dataset(args.tickers, args.days, args.out)

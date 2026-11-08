@@ -62,6 +62,7 @@ from app.services.risk_engine import (
     session_stats,
 )
 from app.services.risk_config import get_risk_config
+from app.config import settings
 from app.services.stream import reset_daily_state
 
 # Silence live alerts during backtest
@@ -124,59 +125,201 @@ def _session_open_for_day(timestamps: pd.Series) -> pd.Timestamp:
     return timestamps.iloc[0]
 
 
-def _log_summary(daily_results, total_trades, total_pnl, use_llm):
-    logger.info("=" * 72)
-    logger.info("OFFLINE MULTI-WEEK DATASET BACKTEST COMPLETED")
-    logger.info("=" * 72)
-    logger.info(f"Total Trading Sessions Replayed: {len(daily_results)}")
-    logger.info(f"Total Executions: {total_trades}")
-    logger.info(f"Net Cumulative Realized P&L: ${total_pnl:+.2f}")
+# --------------------------------------------------------------------------
+# Cross-session aggregation
+# --------------------------------------------------------------------------
+# ``session_stats`` is reset every session (correctly -- it is per-day state),
+# but the summary used to read it *after* the loop, so every aggregate in the
+# report described the final session only. A 21-session run reported 67 trades
+# and +$803.96 while its own exit breakdown described 2 trades and +$91.64.
+# These helpers fold each session into a running total instead.
+def _new_cum() -> Dict[str, Any]:
+    return {
+        "trades": 0, "stop_loss": 0, "take_profit": 0, "time_stop": 0,
+        "breakeven_stop": 0, "eod_close": 0, "manual_close": 0,
+        "gross_pnl": 0.0, "costs": 0.0, "net_pnl": 0.0, "by_signal": {},
+    }
 
-    resolved = session_stats["stop_loss"] + session_stats["take_profit"]
-    timed_out = session_stats["time_stop"] + session_stats["breakeven_stop"]
-    if session_stats["trades"]:
-        logger.info("-" * 72)
-        logger.info("EXIT BREAKDOWN")
-        logger.info(f"  Stop-loss hits        : {session_stats['stop_loss']:3d}  "
-                    f"({session_stats['stop_loss'] / session_stats['trades'] * 100:5.1f}%)")
-        logger.info(f"  Take-profit hits      : {session_stats['take_profit']:3d}  "
-                    f"({session_stats['take_profit'] / session_stats['trades'] * 100:5.1f}%)")
-        logger.info(f"  Time / breakeven stop : {timed_out:3d}  "
-                    f"({timed_out / session_stats['trades'] * 100:5.1f}%)")
-        logger.info(f"  EOD / manual close    : {session_stats['eod_close'] + session_stats['manual_close']:3d}")
-        logger.info(f"  Gross P&L             : ${session_stats['gross_pnl']:+.2f}")
-        logger.info(f"  Transaction costs     : ${session_stats['costs']:.2f}")
-        logger.info(f"  Net P&L               : ${session_stats['net_pnl']:+.2f}")
+
+def _accumulate(cum: Dict[str, Any], s: Dict[str, Any]) -> None:
+    for k in ("trades", "stop_loss", "take_profit", "time_stop",
+              "breakeven_stop", "eod_close", "manual_close"):
+        cum[k] += int(s.get(k, 0) or 0)
+    for k in ("gross_pnl", "costs", "net_pnl"):
+        cum[k] += float(s.get(k, 0.0) or 0.0)
+    for sig, v in (s.get("by_signal") or {}).items():
+        d = cum["by_signal"].setdefault(
+            sig, {"trades": 0, "wins": 0, "losses": 0, "net": 0.0})
+        for k in ("trades", "wins", "losses"):
+            d[k] += int(v.get(k, 0) or 0)
+        d["net"] += float(v.get("net", 0.0) or 0.0)
+
+
+def _trades_from_db(db_path: str) -> List[Dict[str, Any]]:
+    """Every closed trade recorded by this run, as plain dicts.
+
+    ``close_position`` already persists ticker, action, exit reason, signal,
+    cluster, hold time and P&L, so the per-ticker/per-action/per-exit tables
+    come from the journal rather than from a second bookkeeping path that could
+    drift from it.
+    """
+    if not db_path or not os.path.exists(db_path):
+        return []
+    try:
+        import sqlite3
+        with sqlite3.connect(db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute("SELECT * FROM trades").fetchall()
+        return [dict(r) for r in rows]
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning(f"Could not read trade journal {db_path}: {exc}")
+        return []
+
+
+def _max_drawdown(daily_pnls: List[float]) -> Tuple[float, float]:
+    """Peak-to-trough drawdown of the compounded equity curve."""
+    if not daily_pnls:
+        return 0.0, 0.0
+    equity, peak, worst, worst_pct = 1.0, 1.0, 0.0, 0.0
+    for pnl in daily_pnls:
+        equity *= (1.0 + pnl / 25_000.0)
+        peak = max(peak, equity)
+        dd = (peak - equity) / peak
+        if dd > worst:
+            worst, worst_pct = dd, dd * 100.0
+    return worst * 25_000.0, worst_pct
+
+
+def _table(rows: List[Tuple[str, Dict[str, Any]]],
+           cols: Tuple[Tuple[str, str], ...]) -> List[str]:
+    """Fixed-width text table. ``cols`` is ((header, kind), ...) where kind is
+    one of 'n' (count), 'pct' or 'usd'. Keeps the report diffable between runs."""
+    def _cell(v: Any, kind: str) -> str:
+        if v is None:
+            return "-"
+        if kind == "n":
+            return str(v)
+        if kind == "pct":
+            return f"{v:.1f}%"
+        if kind == "usd":
+            return f"${v:+,.2f}"
+        return str(v)
+
+    widths = [len(h) for h, _ in cols]
+    for name, vals in rows:
+        widths[0] = max(widths[0], len(str(name)))
+        for i, (k, kind) in enumerate(cols[1:], start=1):
+            widths[i] = max(widths[i], len(_cell(vals.get(k), kind)))
+    out = ["  " + "  ".join(h.ljust(w) for h, w in zip([c[0] for c in cols], widths))]
+    out.append("  " + "  ".join("-" * w for w in widths))
+    for name, vals in rows:
+        cells = [str(name)] + [_cell(vals.get(k), kind) for k, kind in cols[1:]]
+        out.append("  " + "  ".join(c.ljust(w) for c, w in zip(cells, widths)))
+    return out
+
+
+def _group(trades: List[Dict[str, Any]], key: str) -> List[Tuple[str, Dict[str, Any]]]:
+    """Aggregate the journal by ``key``. Values stay numeric so results.json is
+    machine-readable; only the log table formats them."""
+    agg: Dict[str, Dict[str, Any]] = {}
+    for t in trades:
+        name = str(t.get(key) or "UNKNOWN")
+        d = agg.setdefault(name, {"n": 0, "wins": 0, "net": 0.0})
+        pnl = float(t.get("pnl") or 0.0)
+        d["n"] += 1
+        d["net"] += pnl
+        d["wins"] += 1 if pnl >= 0 else 0
+    out = []
+    for name, d in sorted(agg.items(), key=lambda kv: -kv[1]["net"]):
+        out.append((name, {
+            "n": d["n"],
+            "winrate": round(d["wins"] / d["n"] * 100, 1) if d["n"] else 0.0,
+            "net": round(d["net"], 2),
+            "exp": round(d["net"] / d["n"], 2) if d["n"] else 0.0,
+        }))
+    return out
+
+
+def _log_summary(cum, by_ticker, by_action, by_exit, daily_results,
+                 total_trades, total_pnl, use_llm, cfg, drawdown_usd,
+                 drawdown_pct, journal_rows):
+    logger.info("=" * 78)
+    logger.info("OFFLINE MULTI-WEEK DATASET BACKTEST COMPLETED")
+    logger.info("=" * 78)
+    logger.info(f"Trading sessions replayed : {len(daily_results)}")
+    logger.info(f"Executions                : {total_trades}")
+    logger.info(f"Net cumulative realized   : ${total_pnl:+.2f}")
+    if journal_rows:
+        logger.info(f"Closed trades in journal  : {len(journal_rows)}")
+
+    resolved = cum["stop_loss"] + cum["take_profit"]
+    timed_out = cum["time_stop"] + cum["breakeven_stop"]
+    if cum["trades"]:
+        logger.info("-" * 78)
+        logger.info("EXIT BREAKDOWN (whole run, not the last session)")
+        logger.info(f"  Stop-loss hits        : {cum['stop_loss']:4d}  "
+                    f"({cum['stop_loss'] / cum['trades'] * 100:5.1f}%)")
+        logger.info(f"  Take-profit hits      : {cum['take_profit']:4d}  "
+                    f"({cum['take_profit'] / cum['trades'] * 100:5.1f}%)")
+        logger.info(f"  Time stop             : {cum['time_stop']:4d}  "
+                    f"({cum['time_stop'] / cum['trades'] * 100:5.1f}%)")
+        logger.info(f"  Breakeven stop        : {cum['breakeven_stop']:4d}  "
+                    f"({cum['breakeven_stop'] / cum['trades'] * 100:5.1f}%)")
+        logger.info(f"  EOD / manual close    : {cum['eod_close'] + cum['manual_close']:4d}")
+        logger.info(f"  Gross P&L             : ${cum['gross_pnl']:+.2f}")
+        logger.info(f"  Transaction costs     : ${cum['costs']:.2f}")
+        logger.info(f"  Net P&L               : ${cum['net_pnl']:+.2f}")
         if resolved:
-            win_rate = session_stats["take_profit"] / resolved * 100
+            win_rate = cum["take_profit"] / resolved * 100
             logger.info(f"  Win rate (resolved)   : {win_rate:.1f}%  "
-                        f"-- break-even at a {get_risk_config().min_risk_reward_ratio:g}:1 shape is "
-                        f"{100 / (1 + get_risk_config().min_risk_reward_ratio):.1f}%")
-        logger.info(f"  Expectancy per trade  : ${session_stats['net_pnl'] / session_stats['trades']:+.2f}")
-        gross_win = sum(v["net"] for v in session_stats["by_signal"].values() if v["net"] > 0)
-        gross_loss = sum(v["net"] for v in session_stats["by_signal"].values() if v["net"] < 0)
+                        f"-- break-even at a {cfg.min_risk_reward_ratio:g}:1 shape is "
+                        f"{100 / (1 + cfg.min_risk_reward_ratio):.1f}%")
+        logger.info(f"  Expectancy per trade  : ${cum['net_pnl'] / cum['trades']:+.2f}")
+        gross_win = sum(v["net"] for v in cum["by_signal"].values() if v["net"] > 0)
+        gross_loss = sum(v["net"] for v in cum["by_signal"].values() if v["net"] < 0)
         if gross_loss:
             logger.info(f"  Profit factor         : {gross_win / abs(gross_loss):.3f}")
+        logger.info(f"  Max drawdown          : ${drawdown_usd:.2f} ({drawdown_pct:.2f}%)")
 
-    if session_stats["by_signal"]:
-        logger.info("-" * 72)
+    if by_ticker:
+        logger.info("-" * 78)
+        logger.info("PER-TICKER")
+        for line in _table(by_ticker, (("ticker", "s"), ("n", "n"), ("winrate", "pct"),
+                             ("net", "usd"), ("exp", "usd"))):
+            logger.info(line)
+    if by_action:
+        logger.info("-" * 78)
+        logger.info("PER-ACTION")
+        for line in _table(by_action, (("action", "s"), ("n", "n"), ("winrate", "pct"),
+                             ("net", "usd"), ("exp", "usd"))):
+            logger.info(line)
+    if by_exit:
+        logger.info("-" * 78)
+        logger.info("PER-EXIT-REASON")
+        for line in _table(by_exit, (("exit_reason", "s"), ("n", "n"), ("winrate", "pct"),
+                           ("net", "usd"), ("exp", "usd"))):
+            logger.info(line)
+
+    if cum["by_signal"]:
+        logger.info("-" * 78)
         logger.info("PER-SIGNAL CONDITIONAL STATS")
-        logger.info(f"  {'signal':22s} {'n':>4s} {'win':>4s} {'loss':>5s} {'winrate':>8s} {'net':>10s}")
-        for sig, v in sorted(session_stats["by_signal"].items(), key=lambda kv: -kv[1]["net"]):
+        logger.info(f"  {'signal':22s} {'n':>4s} {'win':>4s} {'loss':>5s} "
+                    f"{'winrate':>8s} {'net':>11s} {'exp':>9s}")
+        for sig, v in sorted(cum["by_signal"].items(), key=lambda kv: -kv[1]["net"]):
             wr = (v["wins"] / v["trades"] * 100) if v["trades"] else 0.0
-            logger.info(
-                f"  {sig:22s} {v['trades']:4d} {v['wins']:4d} {v['losses']:5d} "
-                f"{wr:7.1f}% ${v['net']:+9.2f}"
-            )
+            exp = (v["net"] / v["trades"]) if v["trades"] else 0.0
+            logger.info(f"  {sig:22s} {v['trades']:4d} {v['wins']:4d} {v['losses']:5d} "
+                        f"{wr:7.1f}% ${v['net']:+10.2f} ${exp:+8.2f}")
 
     if daily_results:
         wins = sum(1 for d in daily_results if d["pnl"] > 0)
-        logger.info("-" * 72)
-        logger.info(f"Profitable sessions: {wins}/{len(daily_results)}")
-        logger.info(f"Best  : ${max(d['pnl'] for d in daily_results):+.2f}")
-        logger.info(f"Worst : ${min(d['pnl'] for d in daily_results):+.2f}")
-        logger.info(f"LLM evaluations: {'enabled' if use_llm else 'disabled (reproducible run)'}")
-    logger.info("=" * 72)
+        logger.info("-" * 78)
+        logger.info(f"Profitable sessions      : {wins}/{len(daily_results)}")
+        logger.info(f"Best session             : ${max(d['pnl'] for d in daily_results):+.2f}")
+        logger.info(f"Worst session            : ${min(d['pnl'] for d in daily_results):+.2f}")
+        logger.info(f"LLM evaluations          : "
+                    f"{'enabled' if use_llm else 'disabled (reproducible, zero API quota)'}")
+    logger.info("=" * 78)
 
 
 async def run_simulation(
@@ -184,19 +327,64 @@ async def run_simulation(
     tickers=DEFAULT_TICKERS,
     use_llm: bool = False,
     max_hold_minutes: int = None,
-):
-    cfg = get_risk_config()
+    db_path: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    verbose: bool = True,
+    config_overrides: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Replay a multi-week 1m dataset with the LLM switched off.
+
+    Returns a plain-dict summary (also written to the log) so a caller can run
+    many configurations in one process and compare them. ``None`` on failure.
+    """
+    if not verbose:
+        logger.setLevel(logging.WARNING)
+
+    # reload=True is load-bearing. ``get_risk_config()`` caches a process-wide
+    # singleton, and a sweep reuses worker processes, so without the reload the
+    # second configuration a worker sees would inherit the first one's values
+    # and silently produce a chimera (hold_20m was coming back with
+    # atr_stop_multiplier=2.0 from the previous task).
+    cfg = get_risk_config(reload=True)
+    if config_overrides:
+        from app.services.risk_config import RiskConfig, set_risk_config
+        merged = cfg.to_dict()
+        merged.update(config_overrides)
+        cfg = RiskConfig.from_dict(merged)
+        set_risk_config(cfg)
     if max_hold_minutes is not None:
         cfg.max_hold_minutes = max_hold_minutes
 
     if not os.path.exists(csv_path):
         logger.error(f"Dataset {csv_path} not found. Run download_dataset.py first.")
-        return
+        return None
+
+    # A backtest must never write into the live journal. Without this the
+    # replayed trades land in the same SQLite file the running container uses,
+    # which corrupts real trading history and makes every subsequent report
+    # wrong. Default to a dedicated file.
+    if db_path is None:
+        db_path = os.path.join(os.path.dirname(os.path.abspath(csv_path)),
+                               "backtest_trades.db")
+    os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
+    settings.DATABASE_URL = f"sqlite:///{os.path.abspath(db_path)}"
 
     logger.info(f"Loading local dataset from {csv_path}...")
     df = pd.read_csv(csv_path)
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
     df.sort_values("timestamp", inplace=True)
+
+    if date_from or date_to:
+        dates = df["timestamp"].dt.date
+        if date_from:
+            df = df[dates >= datetime.strptime(date_from, "%Y-%m-%d").date()]
+        if date_to:
+            df = df[dates <= datetime.strptime(date_to, "%Y-%m-%d").date()]
+        df = df.reset_index(drop=True)
+        if df.empty:
+            logger.error(f"No bars between {date_from} and {date_to}.")
+            return None
 
     unique_dates = sorted(list(df["timestamp"].dt.date.unique()))
     logger.info(f"Loaded {len(df)} bars across {len(unique_dates)} trading sessions.")
@@ -205,12 +393,19 @@ async def run_simulation(
     set_clock(_simulated_now)
 
     init_db()
+    # Start from an empty journal so the report describes *this* run only.
+    import sqlite3
+    with sqlite3.connect(settings.DATABASE_URL.replace("sqlite:///", "")) as conn:
+        conn.execute("DELETE FROM trades")
+        conn.commit()
+
     system_state.is_active = True
     system_state.active_tickers = tickers
 
     total_realized_pnl = 0.0
     total_trades_count = 0
     daily_results = []
+    cum = _new_cum()
 
     for sim_date in unique_dates:
         day_df = df[df["timestamp"].dt.date == sim_date].copy()
@@ -224,6 +419,11 @@ async def run_simulation(
         system_state.daily_trade_count = 0
         system_state.session_date = sim_date.strftime("%Y-%m-%d")
         system_state.open_positions = {}
+        # The daily circuit breaker flips is_active to False when a session
+        # breaches max_daily_loss, and nothing in here ever flips it back. Left
+        # alone, one bad day would silently pause every later session in the
+        # run. Restore it per session so each day is judged on its own P&L.
+        system_state.is_active = True
         ticker_cooldowns.clear()
         reset_daily_state()
         reset_session_stats()
@@ -399,6 +599,8 @@ async def run_simulation(
             "trades": day_trades,
             "pnl": system_state.daily_realized_pnl,
         })
+        _accumulate(cum, session_stats)
+
         logger.info(
             f"[{sim_date}] Session P&L: ${system_state.daily_realized_pnl:+.2f} "
             f"({day_trades} trades) | bars: flush={blocked['opening_flush']} "
@@ -413,7 +615,45 @@ async def run_simulation(
                 + ", ".join(f"{k}={v}" for k, v in top)
             )
 
-    _log_summary(daily_results, total_trades_count, total_realized_pnl, use_llm)
+    # ------------------------------------------------------------------ report
+    journal = _trades_from_db(db_path)
+    dd_usd, dd_pct = _max_drawdown([d["pnl"] for d in daily_results])
+    _log_summary(cum, _group(journal, "ticker"), _group(journal, "action"),
+                 _group(journal, "exit_reason"), daily_results,
+                 total_trades_count, total_realized_pnl, use_llm, cfg,
+                 dd_usd, dd_pct, journal)
+
+    return {
+        "sessions": len(daily_results),
+        "trades": total_trades_count,
+        "net_pnl": round(total_realized_pnl, 2),
+        "gross_pnl": round(cum["gross_pnl"], 2),
+        "costs": round(cum["costs"], 2),
+        "stop_loss": cum["stop_loss"],
+        "take_profit": cum["take_profit"],
+        "time_stop": cum["time_stop"],
+        "breakeven_stop": cum["breakeven_stop"],
+        "eod_close": cum["eod_close"],
+        "win_rate_resolved": round(cum["take_profit"] / resolved * 100, 1)
+        if (resolved := cum["stop_loss"] + cum["take_profit"]) else None,
+        "expectancy": round(cum["net_pnl"] / cum["trades"], 2) if cum["trades"] else 0.0,
+        "profit_factor": round(
+            sum(v["net"] for v in cum["by_signal"].values() if v["net"] > 0)
+            / abs(sum(v["net"] for v in cum["by_signal"].values() if v["net"] < 0)), 3
+        ) if any(v["net"] < 0 for v in cum["by_signal"].values()) else None,
+        "max_drawdown_usd": round(dd_usd, 2),
+        "max_drawdown_pct": round(dd_pct, 2),
+        "profitable_sessions": sum(1 for d in daily_results if d["pnl"] > 0),
+        "daily": daily_results,
+        "by_signal": cum["by_signal"],
+        "by_ticker": {name: v for name, v in _group(journal, "ticker")},
+        "by_action": {name: v for name, v in _group(journal, "action")},
+        "by_exit": {name: v for name, v in _group(journal, "exit_reason")},
+        "config": cfg.to_dict(),
+        "use_llm": use_llm,
+        "tickers": list(tickers),
+        "bars": int(len(df)),
+    }
 
 
 if __name__ == "__main__":
@@ -425,6 +665,16 @@ if __name__ == "__main__":
                         help="Enable live Gemini evaluation (off by default for reproducibility).")
     parser.add_argument("--max-hold-minutes", type=int, default=None,
                         help="Override the time stop, in minutes.")
+    parser.add_argument("--db", type=str, default=None,
+                        help="Trade journal for this run. Defaults to "
+                             "backtest_trades.db next to the CSV, so a backtest "
+                             "never writes into the live database.")
+    parser.add_argument("--from", dest="date_from", type=str, default=None,
+                        help="First session to replay, YYYY-MM-DD (inclusive).")
+    parser.add_argument("--to", dest="date_to", type=str, default=None,
+                        help="Last session to replay, YYYY-MM-DD (inclusive).")
+    parser.add_argument("--quiet", action="store_true",
+                        help="Only warnings/errors. Used when sweeping many configs.")
     args = parser.parse_args()
 
     asyncio.run(run_simulation(
@@ -432,4 +682,8 @@ if __name__ == "__main__":
         tickers=[t.strip().upper() for t in args.tickers.split(",") if t.strip()],
         use_llm=args.llm,
         max_hold_minutes=args.max_hold_minutes,
+        db_path=args.db,
+        date_from=args.date_from,
+        date_to=args.date_to,
+        verbose=not args.quiet,
     ))
