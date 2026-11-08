@@ -8,7 +8,6 @@ logger = logging.getLogger("trading_desk_v2.indicators")
 
 
 def _sanitize_float(val: Any, default: Optional[float] = None) -> Optional[float]:
-    """Ensures floats are JSON-compliant and replaces NaN/Inf with default or None."""
     try:
         f = float(val)
         if math.isnan(f) or math.isinf(f):
@@ -19,11 +18,6 @@ def _sanitize_float(val: Any, default: Optional[float] = None) -> Optional[float
 
 
 def calculate_vwap(df: pd.DataFrame) -> pd.Series:
-    """
-    Calculates intraday Volume-Weighted Average Price (VWAP).
-    Typical Price = (High + Low + Close) / 3
-    VWAP = Cumulative(Typical Price * Volume) / Cumulative(Volume)
-    """
     if df.empty or len(df) < 2:
         return pd.Series(dtype=float)
 
@@ -32,13 +26,11 @@ def calculate_vwap(df: pd.DataFrame) -> pd.Series:
     cum_tp_vol = tp_vol.cumsum()
     cum_vol = df["volume"].cumsum()
 
-    # Avoid zero division
     vwap = cum_tp_vol / cum_vol.replace(0, np.nan)
     return vwap.ffill().bfill()
 
 
 def calculate_emas(df: pd.DataFrame, fast_period: int = 9, slow_period: int = 21) -> Dict[str, pd.Series]:
-    """Calculates fast and slow Exponential Moving Averages."""
     if df.empty or len(df) < slow_period:
         return {"ema_fast": pd.Series(dtype=float), "ema_slow": pd.Series(dtype=float)}
 
@@ -48,7 +40,6 @@ def calculate_emas(df: pd.DataFrame, fast_period: int = 9, slow_period: int = 21
 
 
 def calculate_rsi(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    """Calculates Wilder's Relative Strength Index (RSI)."""
     if df.empty or len(df) < period + 1:
         return pd.Series(dtype=float)
 
@@ -65,7 +56,6 @@ def calculate_rsi(df: pd.DataFrame, period: int = 14) -> pd.Series:
 
 
 def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    """Calculates Average True Range (ATR) for volatility and stop sizing."""
     if df.empty or len(df) < 2:
         return pd.Series(dtype=float)
 
@@ -83,25 +73,17 @@ def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
 
 
 def calculate_orb(df: pd.DataFrame, bars_count: int = 15) -> Dict[str, Optional[float]]:
-    """
-    Calculates Opening Range Breakout (ORB) High and Low based on first N bars.
-    """
     if df.empty or len(df) < bars_count:
         return {"orb_high": None, "orb_low": None}
 
     opening_slice = df.iloc[:bars_count]
-    high_val = _sanitize_float(opening_slice["high"].max())
-    low_val = _sanitize_float(opening_slice["low"].min())
     return {
-        "orb_high": high_val,
-        "orb_low": low_val
+        "orb_high": _sanitize_float(opening_slice["high"].max()),
+        "orb_low": _sanitize_float(opening_slice["low"].min())
     }
 
 
 def evaluate_intraday_technical_snapshot(df: pd.DataFrame) -> Dict[str, Any]:
-    """
-    Combines indicators into a sanitized, JSON-safe technical snapshot.
-    """
     if df.empty or len(df) < 25:
         return {
             "status": "INSUFFICIENT_DATA",
@@ -124,40 +106,30 @@ def evaluate_intraday_technical_snapshot(df: pd.DataFrame) -> Dict[str, Any]:
     current_rsi = _sanitize_float(rsi_series.iloc[-1] if not rsi_series.empty else 50.0, default=50.0)
     current_atr = _sanitize_float(atr_series.iloc[-1] if not atr_series.empty else 0.5, default=0.5)
 
-    # Calculate distance from VWAP safely
-    dist_from_vwap_pct = None
+    dist_from_vwap_pct = 0.0
     if current_vwap and current_vwap > 0 and last_close:
-        dist_from_vwap_pct = _sanitize_float(((last_close - current_vwap) / current_vwap) * 100.0)
+        dist_from_vwap_pct = _sanitize_float(((last_close - current_vwap) / current_vwap) * 100.0, default=0.0)
 
-    # Determine Setup Signals
     signal = "NEUTRAL"
     bias_score = 0
 
-    if last_close and current_vwap and current_ema_fast and current_ema_slow:
-        if last_close > current_vwap and current_ema_fast > current_ema_slow:
-            bias_score += 1
-        elif last_close < current_vwap and current_ema_fast < current_ema_slow:
-            bias_score -= 1
+    # Trend alignment check
+    is_bull_trend = last_close > current_vwap and current_ema_fast >= current_ema_slow
+    is_bear_trend = last_close < current_vwap and current_ema_fast <= current_ema_slow
 
-    if orb["orb_high"] and last_close and last_close > orb["orb_high"]:
-        bias_score += 1
-    elif orb["orb_low"] and last_close and last_close < orb["orb_low"]:
-        bias_score -= 1
+    # PULLBACK FILTER: Never buy if extended more than 0.75% above VWAP; never short if extended > 0.75% below VWAP.
+    # High-probability momentum entry: Price is in trend, but within 0.10% - 0.70% of VWAP or EMA ribbon
+    is_bull_pullback = is_bull_trend and (0.05 <= dist_from_vwap_pct <= 0.70)
+    is_bear_pullback = is_bear_trend and (-0.70 <= dist_from_vwap_pct <= -0.05)
 
-    if current_rsi is not None:
-        if current_rsi > 55:
-            bias_score += 1
-        elif current_rsi < 45:
-            bias_score -= 1
-
-    if bias_score >= 2:
-        signal = "BULLISH_MOMENTUM"
-    elif bias_score <= -2:
-        signal = "BEARISH_MOMENTUM"
-    elif current_rsi is not None and current_rsi < 30 and current_ema_fast and last_close and last_close > current_ema_fast:
-        signal = "OVERSOLD_REVERSAL_LONG"
-    elif current_rsi is not None and current_rsi > 70 and current_ema_fast and last_close and last_close < current_ema_fast:
-        signal = "OVERBOUGHT_REVERSAL_SHORT"
+    if is_bull_pullback:
+        if 48 <= current_rsi <= 68:  # Healthy momentum, not overbought
+            signal = "BULLISH_MOMENTUM"
+            bias_score = 2
+    elif is_bear_pullback:
+        if 32 <= current_rsi <= 52:  # Healthy breakdown, not oversold
+            signal = "BEARISH_MOMENTUM"
+            bias_score = -2
 
     return {
         "status": "READY",
