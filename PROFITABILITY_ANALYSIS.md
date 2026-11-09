@@ -575,3 +575,97 @@ proves the *machinery* is correct — the aggregation, the split, the isolation,
 the override handling — and it produced a tidy +$803.96 that means absolutely
 nothing about the market. Only real Yahoo data answers the economic question,
 and that has to be fetched from the QNAP.
+
+---
+
+# PART 4 — Real-data results, and what they actually say
+
+First run on real Yahoo data (15 sessions, 2026-10-19 → 2026-11-06, 77 trades).
+This replaces the synthetic numbers in Part 3, which proved the machinery and
+nothing else.
+
+## Headline
+
+| | |
+|---|---|
+| Net P&L | **−$367.14** |
+| Gross P&L (before costs) | −$169.62 |
+| Transaction costs | **$197.52** |
+| Expectancy | −$4.77/trade |
+| Profitable sessions | 5/15 |
+| Max drawdown | $443.97 (1.78%) |
+
+## The finding that matters: there is no edge to tune
+
+**Costs exceed the gross loss.** $2.57/trade of cost against −$2.20/trade of
+gross P&L. Strip the costs out entirely and the strategy still loses — just
+more slowly.
+
+Narrower still: the 65 time-stopped trades produced **−$27.67 gross over 65
+trades, i.e. −$0.43/trade**. That is a coin flip. The entire gross loss comes
+from the **5 stop-outs at −$51.58 each (−$257.89)**. Everything else washes out
+and then pays $2.57 to find that out.
+
+## The 2.5R target is unreachable
+
+**Take-profit was hit 0 times in 77 trades**, and 0 times across all 19 sweep
+configurations. Every stop sits at exactly 0.800% of price (`min_stop_pct`), so
+the target is exactly 2.000% — and a 2% move in 45 minutes on SPY/QQQ/NVDA does
+not happen. 84.4% of trades exit on the time stop.
+
+This also means `atr_stop_multiplier` is **dead configuration**: ATR × 2.5 on a
+1-minute chart is well under the 0.8% floor, so the floor binds on all 77
+trades. Raising or lowering the multiplier changes nothing — confirmed by
+`atr_2.0` and `atr_3.0` returning results identical to baseline.
+
+## Which parameters do anything
+
+Six of the nineteen sweeps returned numbers **identical to baseline** —
+`atr_2.0`, `atr_3.0`, `rr_2.0`, `rr_3.5`, `no_breakeven`, `pos_5`. Those levers
+are non-binding, so tuning them is motion without progress.
+
+Of the ones that do bind, out-of-sample:
+
+| config | net | note |
+|---|---|---|
+| `relvol_1.2` | **+$3.18** | 7 trades instead of 26 — the only non-losing run, and 7 trades is noise |
+| `risk_25` | −$127.96 | half the risk, half the loss. No edge created. |
+| `minstop_0.015` | −$152.16 | wider stops cut stop-outs from 4 to 1 |
+| baseline | −$256.28 | |
+| `hold_90m` | −$334.87 | holding longer converts time stops into stop losses |
+| `risk_100` | −$395.94 | |
+| `costs_2x` | −$323.11 | costs are already the binding constraint |
+
+**18 of 19 configurations lose money.** When nothing in the parameter space
+works, the problem is the entry signal, not the parameters.
+
+## Bug found and fixed: BREAKEVEN_STOP was a mislabelled time stop
+
+`_manage_position()` labelled the time-stop exit `BREAKEVEN_STOP` whenever the
+breakeven stop had been armed, while still exiting at the market price. Because
+`_resolve_exit()` can only return `STOP_LOSS_HIT` or `TAKE_PROFIT_HIT`, that
+label could only ever have come from the time-stop branch.
+
+The report showed three "breakeven stops" at **+$36.34 average** — a breakeven
+exit should be roughly flat. They were time stops that happened to still be in
+profit. Corrected: TIME_STOP 68 trades −$85.38, BREAKEVEN_STOP 0 trades.
+
+Side effect: the breakeven mechanism never actually produced an exit in this
+dataset, so its value is **untested**, not proven.
+
+## What this means
+
+The strategy is a coin flip that pays $2.57 to play. To break even it needs a
+gross edge of at least $2.57/trade and currently has −$2.20.
+
+The lever that actually moved the number was **trading less** (`relvol_1.2`,
+7 trades) — which is what you would expect if the entry signal has no
+predictive power at a 45-minute horizon on 1-minute momentum. Widening stops
+(`minstop_0.015`) and halving risk (`risk_25`) both reduce the damage without
+creating edge.
+
+Before any further parameter work, the question to answer is whether
+`BULLISH_MOMENTUM` / `BEARISH_MOMENTUM` with 2-bar confirmation predicts
+anything at all. Suggested test: run the replay with entries taken at random
+bars instead of on signal, and compare. If random performs the same, the signal
+is the problem and no amount of stop tuning will fix it.

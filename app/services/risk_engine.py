@@ -657,8 +657,15 @@ def _manage_position(position: Dict[str, Any], quote: Dict[str, Any]) -> Optiona
     if entry_dt is not None:
         held_minutes = (now() - entry_dt).total_seconds() / 60.0
         if held_minutes >= cfg.max_hold_minutes:
-            reason = "BREAKEVEN_STOP" if position.get("breakeven_armed") else "TIME_STOP"
-            return price, reason
+            # The time stop exits at market. Whether breakeven was armed is
+            # already reflected in position["stop_loss"], so labelling this
+            # BREAKEVEN_STOP would book a time stop as a breakeven exit and
+            # make the exit-reason statistics meaningless -- it reported three
+            # "+$36 breakeven stops" that were really time stops that happened
+            # to still be in profit. _resolve_exit() only ever returns
+            # STOP_LOSS_HIT or TAKE_PROFIT_HIT, so BREAKEVEN_STOP could not
+            # have come from anywhere else.
+            return price, "TIME_STOP"
 
     return _resolve_exit(position, quote)
 
