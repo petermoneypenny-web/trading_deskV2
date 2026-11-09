@@ -188,7 +188,35 @@ Return ONLY raw JSON."""
                 return _hold(last_price, f"Gemini API error ({response.status_code}): {err_text[:140]}")
 
             result_data = response.json()
-            raw_text = result_data["candidates"][0]["content"]["parts"][0]["text"].strip()
+
+            # A 200 does NOT guarantee content. Gemini returns an empty (or
+            # absent) candidates array when the prompt is blocked, and an empty
+            # parts array when the model emits nothing -- and the old code
+            # indexed straight through, so the resulting IndexError propagated to
+            # the generic handler below. IndexError's str() is the empty string,
+            # so the desk reported "Evaluation error:" and then nothing at all.
+            # Diagnose the response instead of assuming its shape.
+            candidates = result_data.get("candidates") or []
+            if not candidates:
+                block = (result_data.get("promptFeedback") or {}).get("blockReason")
+                reason = block or "empty candidates array"
+                logger.error(
+                    f"Gemini returned no candidates for {ticker} "
+                    f"({reason}): {json.dumps(result_data)[:400]}"
+                )
+                return _hold(last_price, f"Gemini returned no content ({reason}).")
+
+            parts = (candidates[0].get("content") or {}).get("parts") or []
+            text_part = next((pt for pt in parts if pt.get("text")), None)
+            if text_part is None:
+                finish = candidates[0].get("finishReason") or "no text part"
+                logger.error(
+                    f"Gemini returned no text for {ticker} "
+                    f"({finish}): {json.dumps(result_data)[:400]}"
+                )
+                return _hold(last_price, f"Gemini returned no text ({finish}).")
+
+            raw_text = text_part["text"].strip()
 
             if raw_text.startswith("```json"):
                 raw_text = raw_text[7:]
@@ -210,4 +238,8 @@ Return ONLY raw JSON."""
 
     except Exception as e:
         logger.error(f"Failed to query Gemini agent for {ticker}: {e}", exc_info=True)
-        return _hold(last_price, f"Evaluation error: {str(e)}")
+        # Never report a blank reason: several exceptions (IndexError,
+        # asyncio.TimeoutError) stringify to "", which is how a bare
+        # "Evaluation error:" reached the UI. Always name the type.
+        detail = str(e) or f"{type(e).__name__} (no message)"
+        return _hold(last_price, f"Evaluation error: {detail}")
