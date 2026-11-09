@@ -3,7 +3,7 @@ import asyncio
 import logging
 from datetime import datetime
 from zoneinfo import ZoneInfo
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Tuple
 import yfinance as yf
 import pandas as pd
 
@@ -53,6 +53,39 @@ _inflight_evaluations: set = set()
 # nothing -- the risk loop keeps ticking every 10s regardless.
 LLM_TIMEOUT_SECONDS = float(getattr(settings, "LLM_DEADLINE_SECONDS", 25.0))
 
+# ---------------------------------------------------------------------------
+# Diagnostics
+#
+# Five exit points used to produce no output whatsoever: the engine-paused
+# return, the wrong-phase return, and the four `continue`s in the candidate
+# loop. A paused engine, a NEUTRAL signal and a genuinely broken data feed were
+# therefore indistinguishable in the logs -- all three looked like silence.
+#
+# Both trackers below log only when the observed state *changes*, so a 30s tick
+# does not spam the log while still making every transition visible.
+# ---------------------------------------------------------------------------
+_gate_state: Optional[Tuple[bool, str]] = None
+_candidate_state: Dict[str, str] = {}
+
+
+def _note_gate(reason: str) -> bool:
+    """Log the entry-gate state once per transition. Returns True if it changed."""
+    global _gate_state
+    key = (bool(system_state.is_active), system_state.session_phase)
+    if _gate_state == key:
+        return False
+    _gate_state = key
+    logger.info(f"Entry gate: {reason}")
+    return True
+
+
+def _note_candidate(ticker: str, state: str, detail: str) -> None:
+    """Log a candidate-loop outcome, but only when it changes for that ticker."""
+    if _candidate_state.get(ticker) == state:
+        return
+    _candidate_state[ticker] = state
+    logger.info(f"{ticker}: {detail}")
+
 
 def reset_daily_state():
     """
@@ -62,6 +95,10 @@ def reset_daily_state():
     previous day could carry over and satisfy the 2-bar confirmation on the very
     first bar of a new session.
     """
+    # `global` is required: rebinding _gate_state without it would create a local
+    # and silently leave the module-level tracker pointing at last session.
+    global _gate_state
+
     consecutive_signals.clear()
     ticker_cooldowns.clear()
     system_state.daily_trade_counts = {}
@@ -72,6 +109,8 @@ def reset_daily_state():
     # technical_analysis and are what the entry loop reads until fresh RTH bars
     # arrive -- exactly the stale-data window /signals now refuses to serve.
     system_state.technical_analysis = {}
+    _candidate_state.clear()
+    _gate_state = None
     buffer_manager.reset_session()
     from app.services.risk_engine import reset_session_stats
     reset_session_stats()
@@ -291,8 +330,23 @@ async def sync_market_data():
         await liquidate_all_positions(reason="RTH_EOD_AUTO_CLOSE")
         return
 
-    if not (system_state.is_active and system_state.session_phase in ("RTH_PRIME_MORNING", "RTH_PRIME_AFTERNOON")):
+    # --- entry gate, now visible in the logs ------------------------------
+    if not system_state.is_active:
+        _note_gate(
+            "PAUSED (is_active=False). The 09:25 ET cron sets this True; a "
+            "container restart *after* 09:25 ET leaves it False until the next "
+            "session, because the job has already fired. Override with "
+            "POST /api/session/toggle."
+        )
         return
+    if system_state.session_phase not in ("RTH_PRIME_MORNING", "RTH_PRIME_AFTERNOON"):
+        _note_gate(
+            f"CLOSED for entries -- phase {system_state.session_phase}. Only "
+            f"RTH_PRIME_MORNING (10:15-11:30 ET) and RTH_PRIME_AFTERNOON "
+            f"(14:15-15:30 ET) collect candidates."
+        )
+        return
+    _note_gate(f"OPEN -- phase {system_state.session_phase}, {len(active_tickers)} ticker(s) watched")
 
     # ---------------------------------------------------------------------
     # Candidate collection
@@ -310,14 +364,23 @@ async def sync_market_data():
             tracker = {"signal": signal, "bars": 1 if signal != "NEUTRAL" else 0}
         consecutive_signals[ticker] = tracker
 
+        # Every one of these used to `continue` without a word.
         if signal in ("NEUTRAL", None):
+            _note_candidate(ticker, "no_signal", "no signal (NEUTRAL)")
             continue
         if ticker in system_state.open_positions:
+            _note_candidate(ticker, "position_open", "already holds an open position")
             continue
         if ticker in _inflight_evaluations:
+            _note_candidate(ticker, "in_flight", "evaluation already in flight")
             continue
         if tracker["bars"] < 2:
+            _note_candidate(
+                ticker, f"confirming_{tracker['bars']}",
+                f"{signal} on bar {tracker['bars']}/2 -- waiting for confirmation",
+            )
             continue
+        _note_candidate(ticker, "candidate", f"{signal} confirmed on 2 bars -- proceeding to gates")
 
         action = "BUY" if "BULLISH" in signal or "LONG" in signal else "SELL"
 
@@ -416,7 +479,10 @@ async def _evaluate_and_maybe_trade(cand: Dict[str, Any]):
     if action not in ("BUY", "SELL"):
         logger.info(f"{ticker}: agent returned {action}; no trade.")
         return
-    if confidence and confidence < 78:
+    # Was `if confidence and confidence < 78`. A failed or timed-out Gemini call
+    # falls back to confidence 0, and 0 is falsy, so the guard never fired and the
+    # trade proceeded with no LLM opinion at all. Now 0 correctly blocks.
+    if confidence < 78:
         logger.info(f"{ticker}: agent confidence {confidence} below 78; no trade.")
         return
 
@@ -469,6 +535,16 @@ async def run_intraday_tick_loop():
             system_state.last_loop_timestamp = datetime.utcnow()
 
             await sync_market_data()
+
+            logger.info(
+                f"tick: phase={system_state.session_phase} "
+                f"active={system_state.is_active} "
+                f"quotes={len(system_state.latest_quotes)}/{len(system_state.active_tickers)} "
+                f"analysis={len(system_state.technical_analysis)} "
+                f"open={len(system_state.open_positions)} "
+                f"trades_today={system_state.daily_trade_count} "
+                f"fetch_error={system_state.last_fetch_error or 'none'}"
+            )
 
             # Tick loop runs every 10s during prime trading, 30s during opening flush, midday chop, or paused
             is_prime = system_state.session_phase in ("RTH_PRIME_MORNING", "RTH_PRIME_AFTERNOON")
