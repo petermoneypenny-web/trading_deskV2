@@ -714,8 +714,17 @@ docker compose exec trading-desk-v2 python3 backtest_month.py \
 
 Each seed is a full month replay, so 21 runs at ~2 minutes each across 4 workers
 is roughly **10–12 minutes**. `--random-rate` controls the placebo trade
-frequency; the run warns you if the placebo takes more than 25% fewer or more
-trades than the real arm, in which case adjust it and re-run.
+frequency. **Leave it unset** — it now auto-calibrates by probing five rates
+against the real arm's trade count and interpolating in log-rate space. The
+first real-data run needed this: at the default 0.01 the placebo took 34.5
+trades against the real arm's 77, a 55% shortfall that would have biased the
+comparison. After calibration the two arms matched to within one trade.
+
+Why the count matters: the real arm fills a 6-trades/day budget, so its later
+trades are the ones it scraped up to fill the day. A placebo taking half as
+many trades is a random sample with no such dilution. Comparing per-trade
+expectancy across different counts therefore biases the test *against* the
+signal — the opposite of the direction you would want.
 
 ## Reading the result
 

@@ -318,6 +318,95 @@ def _print_verdict(payload: Dict[str, Any]) -> None:
             logger.info("  Treat only the configs that survive both halves as real.")
 
 
+def _run_batch(tasks: List[Dict[str, Any]], jobs: int) -> List[Dict[str, Any]]:
+    """Run a list of tasks to completion and return their results."""
+    out: List[Dict[str, Any]] = []
+    if not tasks:
+        return out
+    with ProcessPoolExecutor(max_workers=max(1, jobs)) as pool:
+        futs = {pool.submit(_run_one, t): t for t in tasks}
+        for f in as_completed(futs):
+            try:
+                out.append(f.result())
+            except Exception as exc:  # pragma: no cover - defensive
+                out.append({"error": f"{type(exc).__name__}: {exc}"})
+    return out
+
+
+def _calibrate_random_rate(args, tickers, dates, out_dir, _task) -> float:
+    """Pick the placebo entry rate whose trade count matches the real arm.
+
+    Matching the count is not cosmetic. The real arm fills a 6-trades/day
+    budget, so its later trades are the ones it scraped up to fill the day; a
+    placebo taking half as many trades is a random sample with no such
+    dilution. Comparing per-trade expectancy across different counts therefore
+    biases the test against the signal. Probing a few rates and picking the
+    closest removes that bias without the operator having to guess.
+
+    Returns the calibrated rate, or the value the user passed explicitly.
+    """
+    if args.random_rate > 0:
+        return args.random_rate
+
+    import math
+
+    logger.info("Calibrating --random-rate (a few extra runs, run in parallel)...")
+    # Real baseline and every probe run together, so calibration costs about one
+    # run's wall-clock time rather than six.
+    probe_rates = [0.005, 0.01, 0.02, 0.04, 0.08]
+    batch = [_task("REAL_signal", "real", {}, None, None)]
+    for r in probe_rates:
+        batch.append(_task(f"probe_r{r:g}", "probe", {}, None, None,
+                           random_entries=True, random_rate=r, seed=1))
+    results = {r["label"]: r for r in _run_batch(batch, args.jobs) if not r.get("error")}
+
+    real = results.get("REAL_signal")
+    if not real or not real.get("trades"):
+        logger.warning("Could not read the real trade count; falling back to 0.01.")
+        return 0.01
+    target = real["trades"]
+
+    probes = sorted((r, results[f"probe_r{r:g}"]["trades"]) for r in probe_rates
+                    if f"probe_r{r:g}" in results and results[f"probe_r{r:g}"].get("trades"))
+    if not probes:
+        logger.warning("No probe runs succeeded; falling back to 0.01.")
+        return 0.01
+
+    for r, n in probes:
+        logger.info(f"    rate {r:<6g} -> {n:3d} trades   (target {target})")
+
+    # Interpolate in log-rate space between the two probes that bracket the
+    # target, rather than snapping to the nearest grid point. Snapping left the
+    # placebo 33% off the real arm, which is exactly the bias this exists to
+    # remove.
+    rate = None
+    for (r0, n0), (r1, n1) in zip(probes, probes[1:]):
+        if (n0 - target) * (n1 - target) <= 0 and n1 != n0:
+            frac = (target - n0) / (n1 - n0)
+            rate = math.exp(math.log(r0) + frac * (math.log(r1) - math.log(r0)))
+            break
+    if rate is None:
+        rate = min(probes, key=lambda rn: abs(rn[1] - target))[0]
+    rate = min(0.25, max(0.002, rate))
+
+    # Estimate the trade count at the interpolated rate so the operator can see
+    # how good the match is before committing to a 20-seed run.
+    est = None
+    for (r0, n0), (r1, n1) in zip(probes, probes[1:]):
+        if r0 <= rate <= r1 and n1 != n0:
+            est = n0 + (n1 - n0) * (math.log(rate) - math.log(r0)) / (math.log(r1) - math.log(r0))
+            break
+    est_txt = f"~{est:.0f} trades" if est is not None else "unknown trade count"
+    logger.info(f"  Calibrated rate {rate:.4f} -> {est_txt} "
+                f"(real arm: {target}).")
+    if est is not None and abs(est - target) / target > 0.15:
+        logger.warning(f"  Estimated {est:.0f} trades vs the real arm's {target} "
+                       f"({abs(est - target) / target * 100:.0f}% off). The daily "
+                       f"trade cap is probably binding -- both arms would then be "
+                       f"budget-limited and the test loses power.")
+    return rate
+
+
 def _print_null_distribution(real: Optional[Dict[str, Any]],
                              null: List[Dict[str, Any]]) -> None:
     """Compare the real run against a distribution of placebo runs.
@@ -405,10 +494,10 @@ def main() -> int:
                         help="PLACEBO TEST: run N random-entry seeds alongside "
                              "the real baseline and report whether the signal "
                              "beats random. 0 disables (default).")
-    parser.add_argument("--random-rate", type=float, default=0.01,
+    parser.add_argument("--random-rate", type=float, default=0.0,
                         help="Per-ticker-per-bar entry probability for the "
-                             "placebo arm. Tune until its trade count roughly "
-                             "matches the real run.")
+                             "placebo arm. Default 0 = auto-calibrate against "
+                             "the real arm's trade count (recommended).")
     args = parser.parse_args()
 
     if not os.path.exists(args.csv):
@@ -492,8 +581,9 @@ def main() -> int:
         # random seeds form the null distribution it is judged against. Both
         # arms run over the same dates with the same rulebook, so the only
         # difference is the entry decision.
+        args.random_rate = _calibrate_random_rate(args, tickers, dates, out_dir, _task)
         logger.info(f"Placebo test     : {args.random} random seeds at rate "
-                    f"{args.random_rate} per ticker-bar")
+                    f"{args.random_rate:g} per ticker-bar")
         tasks.append(_task("REAL_signal", "real", {}, None, None))
         for seed in range(1, args.random + 1):
             tasks.append(_task(f"random_s{seed}", "random", {}, None, None,
