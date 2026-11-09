@@ -152,6 +152,9 @@ def _run_one(task: Dict[str, Any]) -> Dict[str, Any]:
             verbose=False,
             config_overrides=task["overrides"],
             max_hold_minutes=task.get("max_hold_minutes"),
+            random_entries=task.get("random_entries", False),
+            random_rate=task.get("random_rate", 0.01),
+            seed=task.get("seed", 0),
         ))
     except Exception as exc:  # pragma: no cover - defensive
         return {"label": task["label"], "phase": task["phase"],
@@ -315,6 +318,65 @@ def _print_verdict(payload: Dict[str, Any]) -> None:
             logger.info("  Treat only the configs that survive both halves as real.")
 
 
+def _print_null_distribution(real: Optional[Dict[str, Any]],
+                             null: List[Dict[str, Any]]) -> None:
+    """Compare the real run against a distribution of placebo runs.
+
+    The question is not "is the strategy profitable" -- with 15 sessions that is
+    unanswerable -- but "does entering on the signal beat entering at random".
+    That comparison shares the same market, the same gates and the same costs,
+    so it is far more powerful than comparing either arm to zero.
+    """
+    if real is None or not null:
+        return
+    exps = [r["expectancy"] for r in null if r.get("expectancy") is not None]
+    if len(exps) < 3:
+        logger.warning("Too few placebo runs to form a distribution.")
+        return
+
+    import statistics as st
+    mean, sd = st.mean(exps), (st.stdev(exps) if len(exps) > 1 else 0.0)
+    r = real.get("expectancy") or 0.0
+
+    logger.info("=" * 78)
+    logger.info("PLACEBO TEST -- does the entry signal beat random?")
+    logger.info("=" * 78)
+    logger.info(f"  Real (signal)      : {real['trades']:3d} trades, "
+                f"expectancy ${r:+.2f}, net ${real['net_pnl']:+.2f}")
+    logger.info(f"  Placebo (random)   : {len(exps)} seeds, "
+                f"{st.mean([x['trades'] for x in null]):.1f} trades avg")
+    logger.info(f"  Placebo expectancy : mean ${mean:+.2f}, sd ${sd:.2f}, "
+                f"range ${min(exps):+.2f} .. ${max(exps):+.2f}")
+    lo = sorted(exps)[max(0, int(len(exps) * 0.025))]
+    hi = sorted(exps)[min(len(exps) - 1, int(len(exps) * 0.975))]
+    logger.info(f"  Placebo 95% band   : ${lo:+.2f} .. ${hi:+.2f}")
+    logger.info(f"  Real vs placebo    : ${r - mean:+.2f}/trade "
+                f"({(r - mean) / abs(mean) * 100:+.0f}%)" if mean else
+                f"  Real vs placebo    : ${r - mean:+.2f}/trade")
+
+    beat = sum(1 for e in exps if e >= r)
+    p = beat / (len(exps) + 1)
+    logger.info(f"  Placebo seeds >= real : {beat}/{len(exps)}  "
+                f"-> one-sided p ~ {p:.3f}")
+    if sd > 0:
+        logger.info(f"  z-score             : {(r - mean) / sd:+.2f}")
+
+    if p <= 0.05 and r > mean:
+        logger.info("  VERDICT: the signal beats random at the 5% level.")
+    elif p <= 0.10 and r > mean:
+        logger.info("  VERDICT: weak evidence the signal beats random. "
+                    "Needs more sessions.")
+    elif r <= mean:
+        logger.info("  VERDICT: RANDOM ENTRIES DO AT LEAST AS WELL AS THE SIGNAL.")
+        logger.info("            The entry trigger carries no detectable edge at")
+        logger.info("            this horizon. Tuning stops/targets will not fix it.")
+    else:
+        logger.info("  VERDICT: inconclusive -- the placebo spread is too wide "
+                    "relative to the gap.")
+    logger.info(f"  Caveat: {len(exps)} seeds gives a p-value resolution of "
+                f"~{1/(len(exps)+1):.3f}. Treat as directional.")
+
+
 # --------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------
@@ -339,6 +401,14 @@ def main() -> int:
     parser.add_argument("--label", type=str, default=None, help="Name for this batch.")
     parser.add_argument("--max-hold-minutes", type=int, default=None,
                         help="Override the time stop for every configuration.")
+    parser.add_argument("--random", type=int, default=0, metavar="N",
+                        help="PLACEBO TEST: run N random-entry seeds alongside "
+                             "the real baseline and report whether the signal "
+                             "beats random. 0 disables (default).")
+    parser.add_argument("--random-rate", type=float, default=0.01,
+                        help="Per-ticker-per-bar entry probability for the "
+                             "placebo arm. Tune until its trade count roughly "
+                             "matches the real run.")
     args = parser.parse_args()
 
     if not os.path.exists(args.csv):
@@ -387,7 +457,10 @@ def main() -> int:
     logger.info(f"Tickers        : {', '.join(tickers)}")
     logger.info(f"Configurations : {len(configs)}")
     logger.info(f"Workers        : {args.jobs}")
-    if is_to:
+    if args.random > 0:
+        logger.info(f"Period         : {dates[0]} .. {dates[-1]} "
+                    f"(both arms use the whole period)")
+    elif is_to:
         logger.info(f"In-sample      : {dates[0]} .. {is_to} "
                     f"({sum(1 for d in dates if d <= is_to)} sessions)")
         logger.info(f"Out-of-sample  : {oos_from} .. {dates[-1]} "
@@ -397,23 +470,46 @@ def main() -> int:
 
     # ---- build the task list ---------------------------------------------
     tasks: List[Dict[str, Any]] = []
-    for name, overrides in configs:
-        for phase, dfrom, dto in (("is", None, is_to), ("oos", oos_from, None),
-                                  ("all", None, None)):
-            if phase == "is" and is_to is None:
-                continue
-            if phase == "oos" and oos_from is None:
-                continue
-            if phase == "all" and is_to is not None:
-                continue
-            safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in name)
-            tasks.append({
-                "label": name, "phase": phase, "overrides": overrides,
-                "csv": os.path.abspath(args.csv), "tickers": tickers,
-                "db": os.path.abspath(os.path.join(out_dir, f"journal_{safe}_{phase}.db")),
-                "date_from": dfrom, "date_to": dto,
-                "max_hold_minutes": args.max_hold_minutes,
-            })
+
+    def _task(label, phase, overrides, dfrom, dto, **extra):
+        safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in label)
+        t = {
+            "label": label, "phase": phase, "overrides": overrides,
+            "csv": os.path.abspath(args.csv), "tickers": tickers,
+            "db": os.path.abspath(os.path.join(out_dir, f"journal_{safe}_{phase}.db")),
+            "date_from": dfrom, "date_to": dto,
+            "max_hold_minutes": args.max_hold_minutes,
+        }
+        t.update(extra)
+        return t
+
+    if args.random > 0 and args.sweep != "baseline":
+        logger.warning(f"--random ignores --sweep {args.sweep!r}; the placebo test "
+                       f"always uses the rulebook as-is.")
+
+    if args.random > 0:
+        # Placebo arm. The real baseline is included as the reference, and the
+        # random seeds form the null distribution it is judged against. Both
+        # arms run over the same dates with the same rulebook, so the only
+        # difference is the entry decision.
+        logger.info(f"Placebo test     : {args.random} random seeds at rate "
+                    f"{args.random_rate} per ticker-bar")
+        tasks.append(_task("REAL_signal", "real", {}, None, None))
+        for seed in range(1, args.random + 1):
+            tasks.append(_task(f"random_s{seed}", "random", {}, None, None,
+                               random_entries=True, random_rate=args.random_rate,
+                               seed=seed))
+    else:
+        for name, overrides in configs:
+            for phase, dfrom, dto in (("is", None, is_to), ("oos", oos_from, None),
+                                      ("all", None, None)):
+                if phase == "is" and is_to is None:
+                    continue
+                if phase == "oos" and oos_from is None:
+                    continue
+                if phase == "all" and is_to is not None:
+                    continue
+                tasks.append(_task(name, phase, overrides, dfrom, dto))
 
     os.makedirs(out_dir, exist_ok=True)
 
@@ -536,6 +632,20 @@ def main() -> int:
         ])
 
     _print_verdict(payload)
+    if args.random > 0:
+        real_runs = [r for r in runs if r.get("phase") == "real" and not r.get("error")]
+        null_runs = [r for r in runs if r.get("phase") == "random" and not r.get("error")]
+        _print_null_distribution(real_runs[0] if real_runs else None, null_runs)
+        rt = real_runs[0]["trades"] if real_runs else 0
+        if null_runs:
+            import statistics as _st
+            nt = _st.mean([r["trades"] for r in null_runs])
+            if rt and abs(nt - rt) / rt > 0.25:
+                logger.warning("")
+                logger.warning(f"Placebo trade count ({nt:.1f}) differs from the real "
+                               f"run ({rt}) by more than 25%. Re-run with "
+                               f"--random-rate adjusted so the two arms take a "
+                               f"comparable number of trades.")
     payload.pop("_partial", None)
     _persist(out_dir, payload)
 

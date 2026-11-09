@@ -669,3 +669,77 @@ Before any further parameter work, the question to answer is whether
 anything at all. Suggested test: run the replay with entries taken at random
 bars instead of on signal, and compare. If random performs the same, the signal
 is the problem and no amount of stop tuning will fix it.
+---
+
+# PART 5 — The placebo test
+
+Part 4 concluded the entry signal, not the parameters, is the suspect. This is
+the test that decides it.
+
+## The question
+
+With 15 sessions and 77 trades, "is this strategy profitable" is unanswerable —
+the standard error on a −$4.77 expectancy is roughly ±$5.70. But a different
+question *is* answerable, and it is the one that matters:
+
+> Does entering on `BULLISH_MOMENTUM` / `BEARISH_MOMENTUM` beat entering at
+> random?
+
+Both arms share the same market, the same gates, the same stops, the same exits
+and the same costs. Only the entry decision differs. Comparing them is far more
+powerful than comparing either to zero, because the market conditions cancel.
+
+## How it works
+
+`replay_csv.py --random-entries` runs the identical engine with the entry
+trigger replaced by a coin flip at a fixed per-ticker-per-bar rate. The
+direction is random too, and the ranking score is randomised as well —
+otherwise ranking random entries by the real `setup_score` would leak signal
+back into the placebo arm and bias the test in the signal's favour.
+
+Nothing else changes: macro filter, direction lock, cluster cap, cooldown,
+daily budget, stop geometry, time stop, breakeven arming, commission and
+slippage all apply to both arms identically.
+
+`backtest_month.py --random N` runs the real baseline plus N placebo seeds in
+parallel and reports the null distribution: mean, standard deviation, 95% band,
+how many seeds beat the real run, and a one-sided p-value.
+
+## Running it on the QNAP
+
+```bash
+docker compose exec trading-desk-v2 python3 backtest_month.py \
+  --csv data/historical_1m_30d.csv --random 20 --jobs 4 --random-rate 0.01
+```
+
+Each seed is a full month replay, so 21 runs at ~2 minutes each across 4 workers
+is roughly **10–12 minutes**. `--random-rate` controls the placebo trade
+frequency; the run warns you if the placebo takes more than 25% fewer or more
+trades than the real arm, in which case adjust it and re-run.
+
+## Reading the result
+
+| outcome | meaning |
+|---|---|
+| p ≤ 0.05, real above the band | the signal beats random. Keep tuning parameters. |
+| p ≤ 0.10 | weak evidence. Needs more sessions before acting. |
+| real inside the band | **no detectable edge.** Parameter tuning is wasted effort. |
+| real below the band | the signal is actively harmful — worse than a coin flip. |
+
+With 20 seeds the p-value resolution is ~1/21 ≈ 0.048, so treat it as
+directional rather than exact.
+
+## Sanity check performed
+
+Run against the synthetic random-walk dataset — where by construction no signal
+exists — the test correctly returned *"random entries do at least as well as the
+signal"* with real expectancy $+21.30 against a placebo mean of $+23.26
+(p ≈ 0.40, 2 of 4 seeds ahead). The machinery does not manufacture a win for
+the signal when there is nothing to find.
+
+## What it still cannot do
+
+It cannot tell you *why* a signal fails, only *whether* it does. And a single
+month is one market regime; a signal that is noise in October may not be in a
+trending or high-volatility period. If the placebo test is damning, the next
+step is a different entry idea, not a different stop distance.

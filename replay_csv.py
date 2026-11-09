@@ -32,6 +32,7 @@ previous run misleading:
 """
 
 import os
+import random
 import argparse
 import asyncio
 import logging
@@ -74,6 +75,9 @@ ET = ZoneInfo("America/New_York")
 
 # Holds the bar currently being replayed, so risk_engine's clock can read it.
 _current_bar: Dict[str, datetime] = {"ts": datetime.utcnow()}
+
+# Placebo-arm RNG. Seeded per run so a sweep of seeds is reproducible.
+_rng = random.Random(0)
 
 
 def _simulated_now() -> datetime:
@@ -332,6 +336,9 @@ async def run_simulation(
     date_to: Optional[str] = None,
     verbose: bool = True,
     config_overrides: Optional[Dict[str, Any]] = None,
+    random_entries: bool = False,
+    random_rate: float = 0.01,
+    seed: int = 0,
 ) -> Optional[Dict[str, Any]]:
     """Replay a multi-week 1m dataset with the LLM switched off.
 
@@ -340,6 +347,9 @@ async def run_simulation(
     """
     if not verbose:
         logger.setLevel(logging.WARNING)
+
+    if random_entries:
+        _rng.seed(seed)
 
     # reload=True is load-bearing. ``get_risk_config()`` caches a process-wide
     # singleton, and a sweep reuses worker processes, so without the reload the
@@ -514,15 +524,33 @@ async def run_simulation(
                     tracker = {"signal": sig, "bars": 1 if sig != "NEUTRAL" else 0}
                 consecutive_signals[t] = tracker
 
-                if sig in ("NEUTRAL", None):
-                    continue
-                if t in system_state.open_positions:
-                    continue
-                if tracker["bars"] < 2:
-                    blocked["confirmation"] += 1
-                    continue
+                if random_entries:
+                    # ---- PLACEBO ARM ------------------------------------
+                    # Identical engine, gates, stops, exits and costs. The only
+                    # difference is that the entry decision is a coin flip at a
+                    # fixed rate instead of a confirmed signal. If the signal
+                    # carries information this arm must do materially worse;
+                    # if it performs the same, the signal is noise and no
+                    # amount of stop or target tuning will rescue it.
+                    # Note the score is randomised too, otherwise ranking
+                    # random entries by the real setup_score would leak signal
+                    # back into the placebo arm.
+                    if t in system_state.open_positions:
+                        continue
+                    if _rng.random() >= random_rate:
+                        continue
+                    action = _rng.choice(("BUY", "SELL"))
+                    sig = f"RANDOM_{action}"
+                else:
+                    if sig in ("NEUTRAL", None):
+                        continue
+                    if t in system_state.open_positions:
+                        continue
+                    if tracker["bars"] < 2:
+                        blocked["confirmation"] += 1
+                        continue
 
-                action = "BUY" if "BULLISH" in sig or "LONG" in sig else "SELL"
+                    action = "BUY" if "BULLISH" in sig or "LONG" in sig else "SELL"
 
                 if action == "BUY" and system_state.macro_bias == "BEARISH":
                     blocked["macro"] += 1
@@ -545,7 +573,9 @@ async def run_simulation(
 
                 candidates.append({
                     "ticker": t, "action": action, "signal": sig,
-                    "analysis": analysis, "score": analysis.get("setup_score", 0.0),
+                    "analysis": analysis,
+                    "score": _rng.random() if random_entries
+                             else analysis.get("setup_score", 0.0),
                 })
 
             if not candidates:
@@ -653,6 +683,9 @@ async def run_simulation(
         "use_llm": use_llm,
         "tickers": list(tickers),
         "bars": int(len(df)),
+        "random_entries": bool(random_entries),
+        "random_rate": float(random_rate) if random_entries else None,
+        "seed": int(seed) if random_entries else None,
     }
 
 
@@ -675,6 +708,14 @@ if __name__ == "__main__":
                         help="Last session to replay, YYYY-MM-DD (inclusive).")
     parser.add_argument("--quiet", action="store_true",
                         help="Only warnings/errors. Used when sweeping many configs.")
+    parser.add_argument("--random-entries", action="store_true",
+                        help="PLACEBO ARM: enter at random bars with a random "
+                             "direction instead of on signal. Everything else "
+                             "(gates, stops, exits, costs) is identical.")
+    parser.add_argument("--random-rate", type=float, default=0.01,
+                        help="Per-ticker-per-bar entry probability for the "
+                             "placebo arm. Default 0.01.")
+    parser.add_argument("--seed", type=int, default=0, help="RNG seed for the placebo arm.")
     args = parser.parse_args()
 
     asyncio.run(run_simulation(
@@ -686,4 +727,7 @@ if __name__ == "__main__":
         date_from=args.date_from,
         date_to=args.date_to,
         verbose=not args.quiet,
+        random_entries=args.random_entries,
+        random_rate=args.random_rate,
+        seed=args.seed,
     ))
