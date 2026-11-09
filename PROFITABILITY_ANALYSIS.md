@@ -524,6 +524,20 @@ later wires the replay through the real signal loop. Now restored per session.
   The JSON holds numbers, not formatted strings, so it can be loaded and
   compared programmatically.
 
+## Progress, and what happens if you abort
+
+A full sweep is 38 runs on 15 sessions and takes **20–60 minutes** on a NAS,
+during which nothing is printed until the first run lands — which read as a
+hang. Three things now make that legible:
+
+* `>> start <config> [phase]` is printed the moment a worker picks up a task,
+  so dispatch is visible immediately.
+* A heartbeat line every 30 s: `... 7/38 runs finished, 12.4 min elapsed`.
+* `results.json` is written **before** the first run and rewritten after every
+  one, so the file can be watched for progress and a partial sweep is never
+  lost. Ctrl-C exits immediately (no waiting for in-flight workers) with
+  `Partial results: <dir>/results.json (n/38 runs).` rather than a traceback.
+
 ## Measured on a synthetic 1-month dataset
 
 4 tickers × 21 sessions × 390 bars, U-shaped volume, mean-reverting price:

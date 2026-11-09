@@ -52,6 +52,7 @@ import json
 import logging
 import os
 import sys
+import threading
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime
@@ -136,6 +137,10 @@ def _run_one(task: Dict[str, Any]) -> Dict[str, Any]:
     # spam the console with the same per-bar chatter the parent suppressed.
     logging.getLogger().setLevel(logging.ERROR)
     logging.disable(logging.INFO)
+    # ...but silence is worse than noise when a run takes minutes: print a
+    # start marker so the operator can see work being dispatched. print()
+    # bypasses logging.disable().
+    print(f"    >> start {task['label']} [{task['phase']}]", flush=True)
     try:
         result = asyncio.run(run_simulation(
             csv_path=task["csv"],
@@ -221,8 +226,12 @@ def _rank(rows: List[Dict[str, Any]], key: str) -> List[Dict[str, Any]]:
     return sorted([r for r in rows if r.get(key) is not None], key=lambda r: -r[key])
 
 
-def _write_reports(out_dir: str, payload: Dict[str, Any],
-                   is_rows: List[Dict[str, Any]], oos_rows: List[Dict[str, Any]]) -> None:
+def _persist(out_dir: str, payload: Dict[str, Any]) -> None:
+    """Write every report file. Called after *each* run finishes, so a run the
+    user aborts with Ctrl-C still leaves a readable partial result behind."""
+    runs = payload["runs"]
+    is_rows = [r for r in runs if r.get("phase") == "is" and not r.get("error")]
+    oos_rows = [r for r in runs if r.get("phase") == "oos" and not r.get("error")]
     os.makedirs(out_dir, exist_ok=True)
 
     with open(os.path.join(out_dir, "results.json"), "w", encoding="utf-8") as fh:
@@ -258,7 +267,8 @@ def _write_reports(out_dir: str, payload: Dict[str, Any],
             for tag, by_date in daily.items():
                 w.writerow([tag] + [by_date.get(d, "") for d in dates])
 
-    logger.info(f"Reports written to {out_dir}/")
+    if not payload.get("_partial"):
+        logger.info(f"Reports written to {out_dir}/")
 
 
 def _print_verdict(payload: Dict[str, Any]) -> None:
@@ -406,6 +416,26 @@ def main() -> int:
             })
 
     os.makedirs(out_dir, exist_ok=True)
+
+    def _stub() -> Dict[str, Any]:
+        """Payload skeleton, shared by the pre-run stub and every incremental
+        write so a partially-finished sweep is always readable on disk."""
+        return {
+            "generated": datetime.utcnow().isoformat() + "Z",
+            "dataset": os.path.abspath(args.csv),
+            "tickers": tickers,
+            "sessions": len(dates),
+            "session_dates": dates,
+            "split": {"in_sample_through": is_to, "out_of_sample_from": oos_from},
+            "wall_seconds": 0.0,
+            "runs": [],
+            "_partial": True,
+        }
+
+    # Land a stub immediately. The output file then exists and can be watched
+    # for progress before the first run completes, which on a NAS is minutes.
+    _persist(out_dir, _stub())
+
     logger.info(f"Runs           : {len(tasks)}")
     logger.info(f"Output         : {out_dir}")
     logger.info("-" * 78)
@@ -413,7 +443,21 @@ def main() -> int:
     # ---- execute ----------------------------------------------------------
     runs: List[Dict[str, Any]] = []
     t0 = time.time()
-    with ProcessPoolExecutor(max_workers=max(1, args.jobs)) as pool:
+    stop_hb = threading.Event()
+
+    def _heartbeat() -> None:
+        """A full sweep can run for the better part of an hour. Without this the
+        operator has no way to tell 'slow' from 'dead'."""
+        while not stop_hb.wait(30):
+            elapsed = time.time() - t0
+            logger.info(f"    ... {len(runs)}/{len(tasks)} runs finished, "
+                        f"{elapsed / 60:.1f} min elapsed")
+
+    hb = threading.Thread(target=_heartbeat, daemon=True)
+    hb.start()
+
+    pool = ProcessPoolExecutor(max_workers=max(1, args.jobs))
+    try:
         futures = {pool.submit(_run_one, t): t for t in tasks}
         done = 0
         for fut in as_completed(futures):
@@ -436,6 +480,34 @@ def main() -> int:
                     f"exp={_fmt(res['expectancy'], 'usd'):>9s}  "
                     f"wr={_fmt(res.get('win_rate_resolved'), 'pct'):>6s}  "
                     f"({res.get('elapsed_s', 0):.0f}s)")
+            # Persist after every run so an aborted sweep is still readable.
+            _persist(out_dir, _stub() | {
+                "wall_seconds": round(time.time() - t0, 1),
+                "runs": runs,
+            })
+    except KeyboardInterrupt:
+        # A full sweep can run for the better part of an hour, so aborting must
+        # be quick and must leave the completed runs behind rather than a
+        # traceback. shutdown(wait=False) does not stop workers that are mid
+        # run, and the executor's management thread is non-daemon, so the
+        # interpreter would otherwise block until they finish.
+        stop_hb.set()
+        logger.warning("")
+        logger.warning("Interrupted. Saving the runs that completed...")
+        _persist(out_dir, _stub() | {
+            "wall_seconds": round(time.time() - t0, 1),
+            "runs": runs,
+        })
+        logger.warning(f"Partial results: {out_dir}/results.json "
+                       f"({len(runs)}/{len(tasks)} runs).")
+        try:
+            pool.shutdown(wait=False, cancel_futures=True)
+        except TypeError:  # pragma: no cover - Python < 3.9
+            pool.shutdown(wait=False)
+        sys.stdout.flush()
+        os._exit(130)
+    finally:
+        stop_hb.set()
 
     runs.sort(key=lambda r: (r.get("phase", ""), r.get("label", "")))
     payload = {
@@ -464,7 +536,8 @@ def main() -> int:
         ])
 
     _print_verdict(payload)
-    _write_reports(out_dir, payload, is_rows, oos_rows)
+    payload.pop("_partial", None)
+    _persist(out_dir, payload)
 
     logger.info("=" * 78)
     logger.info(f"{len(tasks)} run(s) in {time.time() - t0:.0f}s "
