@@ -67,6 +67,11 @@ def reset_daily_state():
     system_state.daily_trade_counts = {}
     system_state.daily_trade_count = 0
     system_state.entries_blocked = {}
+    # Drop last session's analysis too. _refresh_indicators skips tickers whose
+    # buffer is empty, so without this the previous session's snapshots sit in
+    # technical_analysis and are what the entry loop reads until fresh RTH bars
+    # arrive -- exactly the stale-data window /signals now refuses to serve.
+    system_state.technical_analysis = {}
     buffer_manager.reset_session()
     from app.services.risk_engine import reset_session_stats
     reset_session_stats()

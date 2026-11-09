@@ -4,6 +4,7 @@ from fastapi import APIRouter, Query, HTTPException
 from pydantic import BaseModel
 from typing import Optional
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from app.core.state import system_state
 from app.config import settings
@@ -309,11 +310,41 @@ async def get_ticker_buffer(ticker: str, interval: str = Query("1m", pattern="^(
 async def get_ticker_signals(ticker: str):
     ticker_upper = ticker.upper()
     analysis = system_state.technical_analysis.get(ticker_upper)
+
     if not analysis:
-        raise HTTPException(status_code=404, detail=f"No technical analysis available for {ticker_upper}")
+        raise HTTPException(
+            status_code=404,
+            detail=f"No technical analysis available for {ticker_upper}"
+        )
+
+    # The analysis must come from the session being traded right now. A buffer
+    # left over from a previous session survives an empty fetch (see
+    # _fetch_batched_intraday), so without this check the desk can serve -- and
+    # act on -- yesterday's bars while labelling them with today's clock.
+    data_timestamp = analysis.get("data_timestamp")
+    session_date = analysis.get("session_date")
+    today_et = datetime.now(ZoneInfo("America/New_York")).date().isoformat()
+
+    if not data_timestamp:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No priced bars available for {ticker_upper}"
+        )
+
+    if session_date and session_date != today_et:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"Stale data for {ticker_upper}: last bar is {data_timestamp} "
+                f"({session_date}), not the current session ({today_et})"
+            )
+        )
+
     return {
         "ticker": ticker_upper,
-        "timestamp": datetime.utcnow().isoformat(),
+        "data_timestamp": data_timestamp,
+        "session_date": session_date,
+        "bars_analyzed": analysis.get("bars_analyzed"),
         "analysis": analysis
     }
 

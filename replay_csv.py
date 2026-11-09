@@ -339,6 +339,9 @@ async def run_simulation(
     random_entries: bool = False,
     random_rate: float = 0.01,
     seed: int = 0,
+    min_atr_pct: Optional[float] = None,
+    max_atr_pct: Optional[float] = None,
+    vwap_trend_only: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """Replay a multi-week 1m dataset with the LLM switched off.
 
@@ -471,7 +474,8 @@ async def run_simulation(
 
         day_trades = 0
         blocked = {"opening_flush": 0, "midday": 0, "macro": 0, "direction": 0,
-                   "confirmation": 0, "cluster": 0, "risk_engine": 0, "budget": 0}
+                   "confirmation": 0, "cluster": 0, "risk_engine": 0, "budget": 0,
+                   "atr_band": 0, "vwap_trend": 0}
 
         for idx in range(30, len(bars_df)):
             ts = bars_df["timestamp"].iloc[idx]
@@ -551,6 +555,40 @@ async def run_simulation(
                         continue
 
                     action = "BUY" if "BULLISH" in sig or "LONG" in sig else "SELL"
+
+                # ---- entry conditioning ---------------------------------
+                # Applied to the placebo arm too, deliberately: a filter that
+                # makes *random* entries profitable has value on its own, and a
+                # filter that only helps the signal tells you the signal is
+                # doing the work. Testing them on the real arm alone cannot
+                # separate those two cases.
+                metrics = analysis.get("metrics", {})
+
+                atr_pct = metrics.get("atr_pct")
+                if atr_pct is not None:
+                    if min_atr_pct is not None and atr_pct < min_atr_pct:
+                        blocked["atr_band"] += 1
+                        continue
+                    if max_atr_pct is not None and atr_pct > max_atr_pct:
+                        blocked["atr_band"] += 1
+                        continue
+
+                if vwap_trend_only:
+                    price_m = metrics.get("last_price")
+                    vwap_m = metrics.get("vwap")
+                    if price_m and vwap_m:
+                        trend = "BUY" if price_m > vwap_m else "SELL"
+                        if action != trend:
+                            # In the placebo arm this is not a veto but a
+                            # re-draw: the hypothesis under test is "trade with
+                            # the VWAP trend", so a random entry is bent to the
+                            # trend rather than discarded.
+                            if random_entries:
+                                action = trend
+                                sig = f"RANDOM_{action}"
+                            else:
+                                blocked["vwap_trend"] += 1
+                                continue
 
                 if action == "BUY" and system_state.macro_bias == "BEARISH":
                     blocked["macro"] += 1
@@ -683,6 +721,15 @@ async def run_simulation(
         "use_llm": use_llm,
         "tickers": list(tickers),
         "bars": int(len(df)),
+        # Resolution rates answer the geometry question directly: at what
+        # stop/target/hold shape do trades actually reach a barrier instead of
+        # expiring? A strategy whose target is never hit cannot win regardless
+        # of entry quality, so this is the first thing to look at.
+        "tp_rate": round(cum["take_profit"] / cum["trades"] * 100, 1) if cum["trades"] else None,
+        "sl_rate": round(cum["stop_loss"] / cum["trades"] * 100, 1) if cum["trades"] else None,
+        "ts_rate": round(cum["time_stop"] / cum["trades"] * 100, 1) if cum["trades"] else None,
+        "resolved_rate": round((cum["take_profit"] + cum["stop_loss"]) / cum["trades"] * 100, 1)
+        if cum["trades"] else None,
         "random_entries": bool(random_entries),
         "random_rate": float(random_rate) if random_entries else None,
         "seed": int(seed) if random_entries else None,
@@ -716,6 +763,14 @@ if __name__ == "__main__":
                         help="Per-ticker-per-bar entry probability for the "
                              "placebo arm. Default 0.01.")
     parser.add_argument("--seed", type=int, default=0, help="RNG seed for the placebo arm.")
+    parser.add_argument("--min-atr-pct", type=float, default=None,
+                        help="Only enter when ATR%% of price is at least this "
+                             "(volatility regime gate).")
+    parser.add_argument("--max-atr-pct", type=float, default=None,
+                        help="Only enter when ATR%% of price is at most this.")
+    parser.add_argument("--vwap-trend-only", action="store_true",
+                        help="Only take trades in the direction of the session "
+                             "VWAP trend. Applies to the placebo arm too.")
     args = parser.parse_args()
 
     asyncio.run(run_simulation(
@@ -730,4 +785,7 @@ if __name__ == "__main__":
         random_entries=args.random_entries,
         random_rate=args.random_rate,
         seed=args.seed,
+        min_atr_pct=args.min_atr_pct,
+        max_atr_pct=args.max_atr_pct,
+        vwap_trend_only=args.vwap_trend_only,
     ))

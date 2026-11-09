@@ -104,6 +104,43 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     "costs_2x":      {"commission_per_share": 0.01, "slippage_pct": 0.0004},
 }
 
+# --------------------------------------------------------------------------
+# Geometry presets
+# --------------------------------------------------------------------------
+# The real-data run hit its take-profit 0 times in 77 trades, so the +2.5R side
+# of the payoff never paid out while the -1R side paid out five times. That is a
+# guaranteed loser regardless of entry quality. These presets sweep the two
+# levers that decide whether a trade can resolve at all: how far the target is,
+# and how long the trade is given to get there.
+#
+# min_risk_reward_ratio is lowered alongside target_rr because RiskConfig
+# rejects any configuration where it exceeds target_rr.
+GEOMETRY_PRESETS: Dict[str, Dict[str, Any]] = {}
+for _rr in (1.2, 1.5, 2.0, 2.5):
+    for _hold in (15, 45, 120):
+        GEOMETRY_PRESETS[f"rr{_rr:g}_h{_hold}"] = {
+            "target_rr": _rr,
+            "min_risk_reward_ratio": _rr,
+            "max_hold_minutes": _hold,
+        }
+
+# --------------------------------------------------------------------------
+# Entry-conditioning presets
+# --------------------------------------------------------------------------
+# Both are applied to the placebo arm as well, so the sweep can distinguish
+# "this filter has value on its own" from "the signal is doing the work".
+# Keys prefixed with _ are passed to the engine as entry filters, not as
+# RiskConfig overrides.
+FILTER_PRESETS: Dict[str, Dict[str, Any]] = {
+    "atr_lo":       {"_min_atr_pct": 0.10},
+    "atr_mid":      {"_min_atr_pct": 0.10, "_max_atr_pct": 0.35},
+    "atr_hi":       {"_min_atr_pct": 0.25},
+    "atr_tight":    {"_max_atr_pct": 0.20},
+    "vwap_trend":   {"_vwap_trend_only": True},
+    "atr_mid+vwap": {"_min_atr_pct": 0.10, "_max_atr_pct": 0.35,
+                     "_vwap_trend_only": True},
+}
+
 
 def _parse_set(pairs: List[str]) -> Dict[str, Any]:
     """``target_rr=3.0,max_hold_minutes=30`` -> dict, with light type coercion."""
@@ -155,6 +192,9 @@ def _run_one(task: Dict[str, Any]) -> Dict[str, Any]:
             random_entries=task.get("random_entries", False),
             random_rate=task.get("random_rate", 0.01),
             seed=task.get("seed", 0),
+            min_atr_pct=task.get("min_atr_pct"),
+            max_atr_pct=task.get("max_atr_pct"),
+            vwap_trend_only=task.get("vwap_trend_only", False),
         ))
     except Exception as exc:  # pragma: no cover - defensive
         return {"label": task["label"], "phase": task["phase"],
@@ -244,7 +284,9 @@ def _persist(out_dir: str, payload: Dict[str, Any]) -> None:
             ("expectancy", "usd"), ("win_rate_resolved", "pct"),
             ("profit_factor", "f"), ("max_drawdown_usd", "usd"),
             ("profitable_sessions", "n"), ("stop_loss", "n"),
-            ("take_profit", "n"), ("time_stop", "n")]
+            ("take_profit", "n"), ("time_stop", "n"),
+            ("tp_rate", "pct"), ("sl_rate", "pct"), ("ts_rate", "pct"),
+            ("resolved_rate", "pct")]
     keys = [c[0] for c in cols]
     for fname, rows in (("summary_in_sample.csv", is_rows), ("summary_out_of_sample.csv", oos_rows)):
         if not rows:
@@ -333,7 +375,7 @@ def _run_batch(tasks: List[Dict[str, Any]], jobs: int) -> List[Dict[str, Any]]:
     return out
 
 
-def _calibrate_random_rate(args, tickers, dates, out_dir, _task) -> float:
+def _calibrate_random_rate(args, tickers, dates, out_dir, _task, filt_over) -> float:
     """Pick the placebo entry rate whose trade count matches the real arm.
 
     Matching the count is not cosmetic. The real arm fills a 6-trades/day
@@ -354,26 +396,37 @@ def _calibrate_random_rate(args, tickers, dates, out_dir, _task) -> float:
     # Real baseline and every probe run together, so calibration costs about one
     # run's wall-clock time rather than six.
     probe_rates = [0.005, 0.01, 0.02, 0.04, 0.08]
-    batch = [_task("REAL_signal", "real", {}, None, None)]
+    # Two seeds per probe. A single seed is too noisy once an entry filter has
+    # shrunk the eligible bar set -- one probe undershot the real arm by 2x,
+    # which then produced a placebo arm taking half its trades. Averaging two
+    # halves that variance for the cost of one extra parallel wave.
+    batch = [_task("REAL_signal", "real", filt_over, None, None)]
     for r in probe_rates:
-        batch.append(_task(f"probe_r{r:g}", "probe", {}, None, None,
-                           random_entries=True, random_rate=r, seed=1))
-    results = {r["label"]: r for r in _run_batch(batch, args.jobs) if not r.get("error")}
+        for sd in (1, 2):
+            batch.append(_task(f"probe_r{r:g}_s{sd}", "probe", filt_over, None, None,
+                               random_entries=True, random_rate=r, seed=sd))
+    by_label = {r["label"]: r for r in _run_batch(batch, args.jobs) if not r.get("error")}
 
-    real = results.get("REAL_signal")
+    real = by_label.get("REAL_signal")
     if not real or not real.get("trades"):
         logger.warning("Could not read the real trade count; falling back to 0.01.")
         return 0.01
     target = real["trades"]
 
-    probes = sorted((r, results[f"probe_r{r:g}"]["trades"]) for r in probe_rates
-                    if f"probe_r{r:g}" in results and results[f"probe_r{r:g}"].get("trades"))
+    probes = []
+    for r in probe_rates:
+        counts = [by_label[f"probe_r{r:g}_s{sd}"]["trades"] for sd in (1, 2)
+                  if f"probe_r{r:g}_s{sd}" in by_label]
+        counts = [c for c in counts if c]
+        if counts:
+            probes.append((r, sum(counts) / len(counts)))
+    probes.sort()
     if not probes:
         logger.warning("No probe runs succeeded; falling back to 0.01.")
         return 0.01
 
     for r, n in probes:
-        logger.info(f"    rate {r:<6g} -> {n:3d} trades   (target {target})")
+        logger.info(f"    rate {r:<6g} -> {n:5.1f} trades   (target {target})")
 
     # Interpolate in log-rate space between the two probes that bracket the
     # target, rather than snapping to the nearest grid point. Snapping left the
@@ -405,6 +458,46 @@ def _calibrate_random_rate(args, tickers, dates, out_dir, _task) -> float:
                        f"trade cap is probably binding -- both arms would then be "
                        f"budget-limited and the test loses power.")
     return rate
+
+
+def _print_geometry_diagnostic(rows: List[Dict[str, Any]]) -> None:
+    """Rank geometries by how often trades actually resolve.
+
+    P&L is the wrong first lens here. A strategy whose target is never reached
+    cannot win no matter how good the entry is, so the question is which
+    stop/target/hold shape lets trades finish -- and only then whether that
+    shape makes money.
+    """
+    if len(rows) < 2:
+        return
+    with_res = [r for r in rows if r.get("resolved_rate") is not None]
+    if not with_res:
+        return
+
+    logger.info("=" * 78)
+    logger.info("GEOMETRY DIAGNOSTIC -- ranked by how often trades resolve")
+    logger.info("=" * 78)
+    _print_table(sorted(with_res, key=lambda r: -r["resolved_rate"]), [
+        ("label", "s"), ("trades", "n"), ("resolved_rate", "pct"),
+        ("tp_rate", "pct"), ("sl_rate", "pct"), ("ts_rate", "pct"),
+        ("expectancy", "usd"), ("net_pnl", "usd"),
+    ])
+
+    best = max(with_res, key=lambda r: r["resolved_rate"])
+    logger.info("-" * 78)
+    logger.info(f"  Most trades resolve at {best['label']}: "
+                f"{best['resolved_rate']}% reach a barrier "
+                f"({best['tp_rate']}% target, {best['sl_rate']}% stop), "
+                f"{best['ts_rate']}% still time out.")
+    if best["tp_rate"] == 0:
+        logger.info("  No geometry in this sweep produced a single take-profit.")
+        logger.info("  That is the finding: at intraday horizons on these")
+        logger.info("  instruments, the targets are unreachable, so the payoff")
+        logger.info("  stays one-sided against you whatever the entry does.")
+    logger.info(f"  Expectancy at the best-resolving geometry: "
+                f"${best['expectancy']:+.2f}/trade.")
+    logger.info("  Read this table before the P&L table. A geometry where")
+    logger.info("  nothing resolves cannot be rescued by a better signal.")
 
 
 def _print_null_distribution(real: Optional[Dict[str, Any]],
@@ -494,6 +587,13 @@ def main() -> int:
                         help="PLACEBO TEST: run N random-entry seeds alongside "
                              "the real baseline and report whether the signal "
                              "beats random. 0 disables (default).")
+    parser.add_argument("--geometry", type=str, default=None,
+                        help="Sweep target/hold geometry: 'all' or a "
+                             "comma-separated list of "
+                             f"{', '.join(list(GEOMETRY_PRESETS)[:4])}, ...")
+    parser.add_argument("--filters", type=str, default=None,
+                        help="Sweep entry-conditioning filters: 'all' or a "
+                             f"comma-separated list of {', '.join(FILTER_PRESETS)}.")
     parser.add_argument("--random-rate", type=float, default=0.0,
                         help="Per-ticker-per-bar entry probability for the "
                              "placebo arm. Default 0 = auto-calibrate against "
@@ -522,6 +622,23 @@ def main() -> int:
         configs.append((name, dict(SWEEPS[name])))
     for pair in args.sets:
         configs.append(("custom:" + pair, _parse_set(pair.split(","))))
+
+    used_geometry = False
+    for flag, presets in (("geometry", GEOMETRY_PRESETS), ("filters", FILTER_PRESETS)):
+        requested = getattr(args, flag)
+        if not requested:
+            continue
+        names_r = [n.strip() for n in requested.split(",") if n.strip()]
+        if "all" in names_r:
+            names_r = list(presets)
+        for n in names_r:
+            if n not in presets:
+                logger.error(f"Unknown {flag} preset {n!r}. Available: "
+                             f"{', '.join(presets)}")
+                return 2
+            configs.append((f"{flag}:{n}", dict(presets[n])))
+        if flag == "geometry":
+            used_geometry = True
     if not configs:
         logger.error("Nothing to run.")
         return 2
@@ -561,13 +678,19 @@ def main() -> int:
     tasks: List[Dict[str, Any]] = []
 
     def _task(label, phase, overrides, dfrom, dto, **extra):
+        # Keys prefixed with _ are engine entry filters, not RiskConfig fields.
+        cfg_over = {k: v for k, v in overrides.items() if not k.startswith("_")}
+        filt = {k[1:]: v for k, v in overrides.items() if k.startswith("_")}
         safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in label)
         t = {
-            "label": label, "phase": phase, "overrides": overrides,
+            "label": label, "phase": phase, "overrides": cfg_over,
             "csv": os.path.abspath(args.csv), "tickers": tickers,
             "db": os.path.abspath(os.path.join(out_dir, f"journal_{safe}_{phase}.db")),
             "date_from": dfrom, "date_to": dto,
             "max_hold_minutes": args.max_hold_minutes,
+            "min_atr_pct": filt.get("min_atr_pct"),
+            "max_atr_pct": filt.get("max_atr_pct"),
+            "vwap_trend_only": bool(filt.get("vwap_trend_only", False)),
         }
         t.update(extra)
         return t
@@ -577,16 +700,37 @@ def main() -> int:
                        f"always uses the rulebook as-is.")
 
     if args.random > 0:
+        # An entry filter is applied to BOTH arms. That is the whole point: a
+        # filter that makes *random* entries profitable has value on its own,
+        # while a filter that only helps the signal means the signal is doing
+        # the work. Testing it on the real arm alone cannot tell those apart.
+        filt_over: Dict[str, Any] = {}
+        if args.filters:
+            names_f = [n.strip() for n in args.filters.split(",") if n.strip()]
+            if "all" in names_f:
+                logger.error("--random takes one filter at a time, not 'all'. "
+                             f"Pick one of: {', '.join(FILTER_PRESETS)}")
+                return 2
+            for n in names_f:
+                if n not in FILTER_PRESETS:
+                    logger.error(f"Unknown filter preset {n!r}. Available: "
+                                 f"{', '.join(FILTER_PRESETS)}")
+                    return 2
+                filt_over.update(FILTER_PRESETS[n])
+            logger.info(f"Entry filter    : {', '.join(names_f)} "
+                        f"(applied to BOTH arms)")
+
         # Placebo arm. The real baseline is included as the reference, and the
         # random seeds form the null distribution it is judged against. Both
-        # arms run over the same dates with the same rulebook, so the only
-        # difference is the entry decision.
-        args.random_rate = _calibrate_random_rate(args, tickers, dates, out_dir, _task)
+        # arms run over the same dates with the same rulebook and the same
+        # filter, so the only difference is the entry decision.
+        args.random_rate = _calibrate_random_rate(args, tickers, dates, out_dir,
+                                                  _task, filt_over)
         logger.info(f"Placebo test     : {args.random} random seeds at rate "
                     f"{args.random_rate:g} per ticker-bar")
-        tasks.append(_task("REAL_signal", "real", {}, None, None))
+        tasks.append(_task("REAL_signal", "real", filt_over, None, None))
         for seed in range(1, args.random + 1):
-            tasks.append(_task(f"random_s{seed}", "random", {}, None, None,
+            tasks.append(_task(f"random_s{seed}", "random", filt_over, None, None,
                                random_entries=True, random_rate=args.random_rate,
                                seed=seed))
     else:
@@ -722,6 +866,9 @@ def main() -> int:
         ])
 
     _print_verdict(payload)
+    if used_geometry:
+        _print_geometry_diagnostic(
+            [r for r in runs if r.get("phase") == "all" and not r.get("error")])
     if args.random > 0:
         real_runs = [r for r in runs if r.get("phase") == "real" and not r.get("error")]
         null_runs = [r for r in runs if r.get("phase") == "random" and not r.get("error")]

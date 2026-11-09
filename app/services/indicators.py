@@ -249,11 +249,33 @@ def score_setup(analysis: Dict[str, Any]) -> float:
     return round(score, 4)
 
 
+def _et_session_date(ts: Any) -> Optional[str]:
+    """US/Eastern calendar date of a bar timestamp, or None if unparseable.
+
+    Used to tell whether a buffer belongs to the session being traded right now
+    or to a prior one, so stale bars can be refused instead of served.
+    """
+    try:
+        t = pd.Timestamp(ts)
+        if t.tzinfo is None:
+            t = t.tz_localize("America/New_York")
+        else:
+            t = t.tz_convert("America/New_York")
+        return t.date().isoformat()
+    except Exception:
+        return None
+
+
 def evaluate_intraday_technical_snapshot(df: pd.DataFrame, session_start=None) -> Dict[str, Any]:
     """
     Combines indicators into a sanitized, JSON-safe technical snapshot.
 
     ``session_start`` anchors VWAP and the opening range to the trading session.
+
+    The snapshot records ``data_timestamp`` / ``session_date`` so every consumer
+    can tell when the bars it is looking at were actually printed. Before this,
+    the API layer stamped responses with ``utcnow()``, so a buffer left over from
+    a previous session was presented as if it were live.
     """
     if df.empty or len(df) < 25:
         return {
@@ -269,6 +291,10 @@ def evaluate_intraday_technical_snapshot(df: pd.DataFrame, session_start=None) -
     rsi_series = calculate_rsi(df, period=14)
     atr_series = calculate_atr(df, period=14)
     orb = calculate_orb(df, bars_count=15, session_start=session_start)
+
+    last_bar_ts = df.index[-1]
+    data_timestamp = last_bar_ts.isoformat() if hasattr(last_bar_ts, "isoformat") else str(last_bar_ts)
+    session_date = _et_session_date(last_bar_ts)
 
     last_close = _sanitize_float(df["close"].iloc[-1], default=0.0)
     current_vwap = _sanitize_float(vwap_series.iloc[-1] if not vwap_series.empty else last_close, default=last_close)
@@ -314,6 +340,8 @@ def evaluate_intraday_technical_snapshot(df: pd.DataFrame, session_start=None) -
     snapshot = {
         "status": "READY",
         "bars_analyzed": len(df),
+        "data_timestamp": data_timestamp,
+        "session_date": session_date,
         "signal": signal,
         "bias_score": bias_score,
         "metrics": {
