@@ -39,3 +39,10 @@ Thumbs.db
 !.vscode/settings.json
 !.vscode/launch.json
 .idea/
+
+# Archives / build artifacts (never commit these)
+*.rar
+*.zip
+*.7z
+*.tar
+*.tar.gz
